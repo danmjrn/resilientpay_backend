@@ -1,0 +1,15 @@
+{
+  "id": "018f7f5d-6f6e-7a01-8c51-00a1b2c3d4e5",
+  "originalTransactionToken": "synth-txn-transfer-001",
+  "operationType": "ACCOUNT_TRANSFER",
+  "amount": 1250.00,
+  "currency": "ZAR",
+  "status": "ACCEPTED",
+  "statusReasonCode": null,
+  "correlationId": "018f7f5d-6f6e-7a01-8c51-00a1b2c3d4e6",
+  "attemptCount": 0,
+  "createdAt": "2026-08-20T12:00:00Z",
+  "updatedAt": "2026-08-20T12:00:00Z",
+  "version": 0,
+  "allowedActions": ["VIEW", "CHECK_OUTCOME"]
+}

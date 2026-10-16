@@ -1,0 +1,7 @@
+spring:
+  rabbitmq:
+    password: ${RESILIENTPAY_RABBIT_PASSWORD:resilientpay-local-only}
+
+resilientpay:
+  simulator:
+    message-hmac-key: ${RESILIENTPAY_MESSAGE_HMAC_KEY:local-demo-message-key}

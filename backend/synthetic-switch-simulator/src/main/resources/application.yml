@@ -1,0 +1,65 @@
+spring:
+  application:
+    name: resilientpay-synthetic-switch
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+  rabbitmq:
+    host: ${RESILIENTPAY_RABBIT_HOST:localhost}
+    port: ${RESILIENTPAY_RABBIT_PORT:5672}
+    username: ${RESILIENTPAY_RABBIT_USERNAME:resilientpay}
+    password: ${RESILIENTPAY_RABBIT_PASSWORD:}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      observation-enabled: true
+    listener:
+      simple:
+        observation-enabled: true
+        default-requeue-rejected: false
+        prefetch: 10
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 100ms
+          multiplier: 2
+          max-interval: 500ms
+server:
+  port: ${RESILIENTPAY_SIMULATOR_PORT:8082}
+logging:
+  structured:
+    format:
+      console: ecs
+    ecs:
+      service:
+        name: ${spring.application.name}
+        version: 0.1.0
+management:
+  opentelemetry:
+    resource-attributes:
+      service.name: ${OTEL_SERVICE_NAME:${spring.application.name}}
+    tracing:
+      export:
+        otlp:
+          endpoint: ${RESILIENTPAY_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+          transport: http
+  otlp:
+    metrics:
+      export:
+        url: ${RESILIENTPAY_OTLP_METRICS_ENDPOINT:http://localhost:4318/v1/metrics}
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  tracing:
+    sampling:
+      probability: ${RESILIENTPAY_TRACE_SAMPLE_PROBABILITY:1.0}
+resilientpay:
+  simulator:
+    scenario: ${RESILIENTPAY_SIMULATOR_SCENARIO:SUCCEED}
+    delay: ${RESILIENTPAY_SIMULATOR_DELAY:0ms}
+    message-hmac-key: ${RESILIENTPAY_MESSAGE_HMAC_KEY:}
+    signature-key-id: ${RESILIENTPAY_MESSAGE_KEY_ID:demo-message-v1}
+    fault-injection-enabled: ${RESILIENTPAY_SIMULATOR_FAULT_INJECTION_ENABLED:false}
+    publish-confirm-timeout: ${RESILIENTPAY_SIMULATOR_PUBLISH_CONFIRM_TIMEOUT:2s}
+    journal-directory: ${RESILIENTPAY_SIMULATOR_JOURNAL_DIRECTORY:${user.home}/.resilientpay/journal}

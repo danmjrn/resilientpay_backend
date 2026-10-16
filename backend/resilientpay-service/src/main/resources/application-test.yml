@@ -1,0 +1,31 @@
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+      - org.springframework.boot.hibernate.autoconfigure.HibernateJpaAutoConfiguration
+      - org.springframework.boot.flyway.autoconfigure.FlywayAutoConfiguration
+      - org.springframework.boot.amqp.autoconfigure.RabbitAutoConfiguration
+      - org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration
+      - org.springframework.boot.data.redis.autoconfigure.DataRedisRepositoriesAutoConfiguration
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://test.invalid/issuer
+  task:
+    scheduling:
+      enabled: false
+management:
+  tracing:
+    enabled: false
+resilientpay:
+  http:
+    allowed-origins:
+      - http://localhost:3000
+  security:
+    audience: resilientpay-api
+    evidence-hmac-key: deterministic-test-only-key
+    evidence-key-id: test-v1
+    approval-acr: urn:resilientpay:aal2
+  messaging:
+    hmac-key: deterministic-test-message-key

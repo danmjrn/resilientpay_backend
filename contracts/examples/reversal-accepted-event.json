@@ -1,0 +1,17 @@
+{
+  "headers": {
+    "messageId": "018f7f5d-6f6e-7a01-8c51-00a1b2c3d4e7",
+    "correlationId": "018f7f5d-6f6e-7a01-8c51-00a1b2c3d4e6",
+    "causationId": "018f7f5d-6f6e-7a01-8c51-00a1b2c3d4e5",
+    "schemaVersion": "1",
+    "tenantId": "00000000-0000-0000-0000-000000000001",
+    "signatureKeyId": "demo-message-v1",
+    "signature": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "payload": {
+    "reversalCommandId": "018f7f5d-6f6e-7a01-8c51-00a1b2c3d4e5",
+    "operationType": "ACCOUNT_TRANSFER",
+    "policyVersion": 1,
+    "acceptedAt": "2026-08-20T12:00:00Z"
+  }
+}

@@ -1,0 +1,163 @@
+spring:
+  application:
+    name: resilientpay-reversal-orchestrator
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+  datasource:
+    url: ${RESILIENTPAY_DATABASE_URL:jdbc:postgresql://localhost:5432/resilientpay}
+    username: ${RESILIENTPAY_DATABASE_USERNAME:resilientpay}
+    password: ${RESILIENTPAY_DATABASE_PASSWORD}
+    hikari:
+      maximum-pool-size: ${RESILIENTPAY_DATABASE_POOL_SIZE:10}
+      connection-timeout: 3000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  rabbitmq:
+    host: ${RESILIENTPAY_RABBIT_HOST:localhost}
+    port: ${RESILIENTPAY_RABBIT_PORT:5672}
+    username: ${RESILIENTPAY_RABBIT_USERNAME:resilientpay}
+    password: ${RESILIENTPAY_RABBIT_PASSWORD}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    listener:
+      simple:
+        default-requeue-rejected: false
+        prefetch: ${RESILIENTPAY_RABBIT_PREFETCH:20}
+        concurrency: ${RESILIENTPAY_RABBIT_CONCURRENCY:2}
+        max-concurrency: ${RESILIENTPAY_RABBIT_MAX_CONCURRENCY:8}
+        retry:
+          enabled: true
+          max-retries: ${RESILIENTPAY_MESSAGE_RETRY_ATTEMPTS:3}
+          initial-interval: ${RESILIENTPAY_MESSAGE_RETRY_INITIAL_INTERVAL:250ms}
+          multiplier: 2
+          max-interval: ${RESILIENTPAY_MESSAGE_RETRY_MAXIMUM_INTERVAL:2s}
+  data:
+    redis:
+      host: ${RESILIENTPAY_REDIS_HOST:localhost}
+      port: ${RESILIENTPAY_REDIS_PORT:6379}
+      password: ${RESILIENTPAY_REDIS_PASSWORD}
+      timeout: ${RESILIENTPAY_REDIS_TIMEOUT:2s}
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${RESILIENTPAY_OIDC_ISSUER:http://localhost:8081/realms/resilientpay}
+          jwk-set-uri: ${RESILIENTPAY_OIDC_JWK_SET_URI:http://localhost:8081/realms/resilientpay/protocol/openid-connect/certs}
+
+logging:
+  structured:
+    format:
+      console: ecs
+    ecs:
+      service:
+        name: ${spring.application.name}
+        version: 0.1.0
+
+management:
+  otlp:
+    metrics:
+      export:
+        url: ${RESILIENTPAY_OTLP_METRICS_ENDPOINT:http://localhost:4318/v1/metrics}
+  opentelemetry:
+    resource-attributes:
+      service.name: ${OTEL_SERVICE_NAME:${spring.application.name}}
+    tracing:
+      export:
+        otlp:
+          endpoint: ${RESILIENTPAY_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+          transport: http
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include:
+            - readinessState
+            - db
+            - rabbit
+            - redis
+      show-details: never
+  tracing:
+    sampling:
+      probability: ${RESILIENTPAY_TRACE_SAMPLE_PROBABILITY:1.0}
+server:
+  shutdown: graceful
+  max-http-request-header-size: 16KB
+  error:
+    include-message: never
+    include-stacktrace: never
+
+resilientpay:
+  http:
+    allowed-origins:
+      - ${RESILIENTPAY_UI_ORIGIN:http://localhost:3000}
+  security:
+    audience: ${RESILIENTPAY_OIDC_AUDIENCE:resilientpay-api}
+    evidence-hmac-key: ${RESILIENTPAY_EVIDENCE_HMAC_KEY}
+    evidence-key-id: ${RESILIENTPAY_EVIDENCE_KEY_ID:demo-v1}
+    approval-acr: ${RESILIENTPAY_APPROVAL_ACR:urn:resilientpay:aal2}
+  runtime:
+    roles: ${RESILIENTPAY_RUNTIME_ROLES:api,outbox-publisher,worker,reconciler}
+  outbox:
+    batch-size: ${RESILIENTPAY_OUTBOX_BATCH_SIZE:50}
+    lease-duration: ${RESILIENTPAY_OUTBOX_LEASE_DURATION:30s}
+    poll-delay: ${RESILIENTPAY_OUTBOX_POLL_DELAY:500ms}
+    max-attempts: ${RESILIENTPAY_OUTBOX_MAX_ATTEMPTS:8}
+    confirm-timeout: ${RESILIENTPAY_OUTBOX_CONFIRM_TIMEOUT:5s}
+    cold-retry-delay: ${RESILIENTPAY_OUTBOX_COLD_RETRY_DELAY:5m}
+    max-recovery-cycles: ${RESILIENTPAY_OUTBOX_MAX_RECOVERY_CYCLES:3}
+  reconciliation:
+    poll-delay: ${RESILIENTPAY_RECONCILIATION_POLL_DELAY:5s}
+    batch-size: ${RESILIENTPAY_RECONCILIATION_BATCH_SIZE:25}
+    evidence-window: ${RESILIENTPAY_RECONCILIATION_EVIDENCE_WINDOW:24h}
+  rate-limit:
+    capacity: ${RESILIENTPAY_RATE_LIMIT_CAPACITY:30}
+    window: ${RESILIENTPAY_RATE_LIMIT_WINDOW:1m}
+  messaging:
+    exchange: resilientpay.reversal.lifecycle.v1
+    accepted-queue: resilientpay.lifecycle.accepted.v1
+    original-status-queue: resilientpay.lifecycle.original-status.v1
+    execution-queue: resilientpay.synthetic-switch.execution.v1
+    outcome-queue: resilientpay.orchestrator.outcome.v1
+    quarantine-exchange: resilientpay.reversal.quarantine.v1
+    quarantine-queue: resilientpay.orchestrator.quarantine.v1
+    accepted-routing-key: reversal.accepted.v1
+    original-status-routing-key: original-transaction.status-changed.v1
+    execution-routing-key: reversal.execution.requested.v1
+    outcome-routing-key: reversal.outcome.observed.v1
+    quarantine-routing-key: message.quarantined.v1
+    execution-quarantine-routing-key: reversal.execution.quarantined.v1
+    consumer-name: resilientpay-outcome-v1
+    hmac-key: ${RESILIENTPAY_MESSAGE_HMAC_KEY}
+    key-id: ${RESILIENTPAY_MESSAGE_KEY_ID:demo-message-v1}
+    maximum-payload-bytes: ${RESILIENTPAY_MESSAGE_MAXIMUM_PAYLOAD_BYTES:16384}
+    retry-initial-interval: ${RESILIENTPAY_MESSAGE_RETRY_INITIAL_INTERVAL:250ms}
+    retry-maximum-interval: ${RESILIENTPAY_MESSAGE_RETRY_MAXIMUM_INTERVAL:2s}
+    retry-attempts: ${RESILIENTPAY_MESSAGE_RETRY_ATTEMPTS:3}
+
+springdoc:
+  api-docs:
+    path: /api/openapi
+  swagger-ui:
+    path: /api/swagger-ui
+    operations-sorter: alpha
+    tags-sorter: alpha

@@ -1,0 +1,8 @@
+{
+  "originalTransactionToken": "synth-txn-transfer-001",
+  "operationType": "ACCOUNT_TRANSFER",
+  "amount": 1250.00,
+  "currency": "ZAR",
+  "reason": "DUPLICATE_POSTING",
+  "demonstrationFailure": "INTERRUPT_ONCE"
+}

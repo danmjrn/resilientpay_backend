@@ -1,0 +1,9 @@
+{
+  "type": "/problems/idempotency-key-reused",
+  "title": "Idempotency key was reused with a different request",
+  "status": 409,
+  "detail": "Use the original request or a new idempotency key.",
+  "instance": "/api/v1/reversalcommands",
+  "code": "IDEMPOTENCY_KEY_REUSED",
+  "correlationId": "018f7f5d-6f6e-7a01-8c51-00a1b2c3d4e6"
+}

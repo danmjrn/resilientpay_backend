@@ -1,0 +1,23 @@
+management:
+  tracing:
+    enabled: true
+    sampling:
+      probability: 1.0
+spring:
+  datasource:
+    password: ${RESILIENTPAY_DATABASE_PASSWORD:resilientpay-local-only}
+  rabbitmq:
+    password: ${RESILIENTPAY_RABBIT_PASSWORD:resilientpay-local-only}
+  data:
+    redis:
+      password: ${RESILIENTPAY_REDIS_PASSWORD:resilientpay-local-only}
+  flyway:
+    locations: classpath:db/migration,classpath:db/devseed
+resilientpay:
+  http:
+    allowed-origins:
+      - ${RESILIENTPAY_UI_ORIGIN:http://localhost:3000}
+  security:
+    evidence-hmac-key: ${RESILIENTPAY_EVIDENCE_HMAC_KEY:local-demo-evidence-key}
+  messaging:
+    hmac-key: ${RESILIENTPAY_MESSAGE_HMAC_KEY:local-demo-message-key}

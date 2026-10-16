@@ -1,0 +1,534 @@
+openapi: 3.1.0
+info:
+  title: ResilientPay Reversal Orchestrator API
+  version: 0.1.0
+  description: >-
+    Clean-room API for asynchronous full-reversal acceptance, execution and
+    reconciliation. Every identifier and example is synthetic. A 202 response
+    confirms durable acceptance, not downstream financial completion.
+  contact:
+    name: Shape It Solutions Pty Ltd
+servers:
+  - url: http://localhost:8080
+    description: Synthetic local environment
+tags:
+  - name: Reversal commands
+  - name: Original transactions
+  - name: Operation policies
+  - name: Reconciliation
+paths:
+  /api/v1/reversalcommands:
+    post:
+      tags: [Reversal commands]
+      operationId: acceptReversalCommand
+      summary: Durably accept one full reversal command
+      security:
+        - oidc: [reversals.write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcceptReversalRequest'
+            examples:
+              interruptedSyntheticTransfer:
+                description: Synthetic request used by the primary recovery demo.
+                value:
+                  originalTransactionToken: synth-txn-transfer-001
+                  operationType: ACCOUNT_TRANSFER
+                  amount: 1250.00
+                  currency: ZAR
+                  reason: DUPLICATE_POSTING
+                  demonstrationFailure: INTERRUPT_ONCE
+      responses:
+        '202':
+          description: Command durably accepted for asynchronous processing.
+          headers:
+            Location:
+              schema: { type: string, format: uri-reference }
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+            Idempotency-Replayed:
+              description: True when the original safe response is replayed.
+              schema: { type: boolean }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReversalCommand'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Problem'
+        '403':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
+    get:
+      tags: [Reversal commands]
+      operationId: listReversalCommands
+      summary: List tenant-scoped reversal commands
+      security:
+        - oidc: [reversals.read]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ReversalStatus'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+      responses:
+        '200':
+          description: Tenant-scoped commands, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items:
+                  $ref: '#/components/schemas/ReversalCommand'
+        '401':
+          $ref: '#/components/responses/Problem'
+  /api/v1/reversalcommands/{commandId}:
+    parameters:
+      - $ref: '#/components/parameters/CommandId'
+    get:
+      tags: [Reversal commands]
+      operationId: getReversalCommand
+      security:
+        - oidc: [reversals.read]
+      responses:
+        '200':
+          description: Current tenant-scoped command representation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReversalCommand'
+        '404':
+          $ref: '#/components/responses/Problem'
+  /api/v1/reversalcommands/{commandId}/retry:
+    parameters:
+      - $ref: '#/components/parameters/CommandId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CorrelationId'
+    post:
+      tags: [Reversal commands]
+      operationId: requestSafeReversalRetry
+      summary: Request retry only after non-execution is proven
+      security:
+        - oidc: [reversals.retry]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetryRequest'
+      responses:
+        '202':
+          description: A bounded safe retry was accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReversalCommand'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
+  /api/v1/reversalcommands/{commandId}/evidence:
+    parameters:
+      - $ref: '#/components/parameters/CommandId'
+    get:
+      tags: [Reversal commands]
+      operationId: getReversalEvidence
+      security:
+        - oidc: [audit.read]
+      responses:
+        '200':
+          description: Redacted, integrity-verifiable lifecycle evidence.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditEvidence'
+  /api/v1/originaltransactions:
+    post:
+      tags: [Original transactions]
+      operationId: ingestSyntheticOriginalTransaction
+      summary: Ingest a synthetic original transaction for the portfolio demo
+      security:
+        - oidc: [transactions.write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OriginalTransactionRequest'
+      responses:
+        '201':
+          description: Synthetic original transaction created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OriginalTransaction'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
+    get:
+      tags: [Original transactions]
+      operationId: listOriginalTransactions
+      security:
+        - oidc: [transactions.read]
+      responses:
+        '200':
+          description: Tenant-scoped synthetic transactions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OriginalTransaction'
+  /api/v1/operationpolicys:
+    get:
+      tags: [Operation policies]
+      operationId: listOperationPolicysSourceCompatible
+      summary: List active operation policies using the source-prescribed resource spelling
+      security:
+        - oidc: [policies.read]
+      responses:
+        '200':
+          description: Active tenant-scoped policy snapshots.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OperationPolicy'
+  /api/v1/operationpolicies:
+    get:
+      tags: [Operation policies]
+      operationId: listOperationPoliciesCanonicalAlias
+      summary: Canonical compatibility alias for operation policies
+      description: ADR-005 retains the source path and exposes this non-breaking alias.
+      security:
+        - oidc: [policies.read]
+      responses:
+        '200':
+          description: Same representation as the source-compatible path.
+          headers:
+            Content-Location:
+              schema: { type: string, const: /api/v1/operationpolicys }
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OperationPolicy'
+  /api/v1/reconciliationcases:
+    get:
+      tags: [Reconciliation]
+      operationId: listReconciliationCases
+      security:
+        - oidc: [reconciliation.read]
+      responses:
+        '200':
+          description: Operator-actionable tenant-scoped cases.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ReconciliationCase'
+  /api/v1/reconciliationcases/{caseId}/decisions:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CorrelationId'
+    post:
+      tags: [Reconciliation]
+      operationId: proposeReconciliationDecision
+      security:
+        - oidc: [reconciliation.decide]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReconciliationDecisionRequest'
+      responses:
+        '202':
+          description: Decision recorded and awaiting distinct approval.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationCase'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
+  /api/v1/reconciliationcases/{caseId}/approvals:
+    parameters:
+      - $ref: '#/components/parameters/CaseId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/CorrelationId'
+    post:
+      tags: [Reconciliation]
+      operationId: approveReconciliationDecision
+      security:
+        - oidc: [reconciliation.approve]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReconciliationApprovalRequest'
+      responses:
+        '200':
+          description: Distinct maker-checker approval applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationCase'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/Problem'
+        '503':
+          $ref: '#/components/responses/Problem'
+components:
+  securitySchemes:
+    oidc:
+      type: openIdConnect
+      openIdConnectUrl: http://localhost:9080/realms/resilientpay/.well-known/openid-configuration
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 16, maxLength: 128, pattern: '^[A-Za-z0-9._~-]+$' }
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      schema: { type: string, format: uuid }
+    CommandId:
+      name: commandId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  headers:
+    CorrelationId:
+      description: Safe correlation reference propagated across boundaries.
+      schema: { type: string, format: uuid }
+  responses:
+    Problem:
+      description: Standards-based, redacted domain or authorization failure.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    OperationType:
+      type: string
+      enum: [CARD_PURCHASE, ACCOUNT_TRANSFER, CASH_WITHDRAWAL, MERCHANT_PAYOUT]
+    ReversalStatus:
+      type: string
+      enum:
+        - ACCEPTED
+        - ROUTED
+        - EXECUTION_PENDING
+        - EXECUTING
+        - RETRY_SCHEDULED
+        - RECONCILIATION_REQUIRED
+        - COMPLETED
+        - REJECTED
+        - QUARANTINED
+    MoneyAmount:
+      type: number
+      multipleOf: 0.01
+      exclusiveMinimum: 0
+      maximum: 999999999999999.99
+    AcceptReversalRequest:
+      type: object
+      additionalProperties: false
+      required: [originalTransactionToken, operationType, amount, currency, reason]
+      properties:
+        originalTransactionToken: { type: string, pattern: '^synth-[a-z0-9-]{8,64}$' }
+        operationType: { $ref: '#/components/schemas/OperationType' }
+        amount: { $ref: '#/components/schemas/MoneyAmount' }
+        currency: { type: string, pattern: '^[A-Z]{3}$', examples: [ZAR] }
+        reason: { type: string, minLength: 3, maxLength: 120 }
+        demonstrationFailure:
+          type: string
+          enum: [NONE, INTERRUPT_ONCE, AMBIGUOUS, REJECT]
+          default: NONE
+          description: Synthetic local-demo control; excluded from production profiles.
+    ReversalCommand:
+      type: object
+      additionalProperties: false
+      required: [id, operationType, amount, currency, status, correlationId, createdAt, version]
+      properties:
+        id: { type: string, format: uuid }
+        originalTransactionToken: { type: string }
+        operationType: { $ref: '#/components/schemas/OperationType' }
+        amount: { $ref: '#/components/schemas/MoneyAmount' }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        status: { $ref: '#/components/schemas/ReversalStatus' }
+        statusReasonCode: { type: [string, 'null'], maxLength: 64 }
+        correlationId: { type: string, format: uuid }
+        attemptCount: { type: integer, minimum: 0, maximum: 5 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        version: { type: integer, minimum: 0 }
+        allowedActions:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum: [VIEW, CHECK_OUTCOME, REQUEST_SAFE_RETRY, VIEW_EVIDENCE]
+    RetryRequest:
+      type: object
+      additionalProperties: false
+      required: [proof, purpose]
+      properties:
+        proof: { type: string, enum: [CONFIRMED_NOT_EXECUTED] }
+        purpose: { type: string, minLength: 8, maxLength: 160 }
+    OriginalTransactionRequest:
+      type: object
+      additionalProperties: false
+      required: [transactionToken, operationType, amount, currency]
+      properties:
+        transactionToken: { type: string, pattern: '^synth-[a-z0-9-]{8,64}$' }
+        operationType: { $ref: '#/components/schemas/OperationType' }
+        amount: { $ref: '#/components/schemas/MoneyAmount' }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+    OriginalTransaction:
+      allOf:
+        - $ref: '#/components/schemas/OriginalTransactionRequest'
+        - type: object
+          required: [id, status, createdAt]
+          properties:
+            id: { type: string, format: uuid }
+            status: { type: string, enum: [POSTED, REVERSAL_RESERVED, REVERSED] }
+            createdAt: { type: string, format: date-time }
+    OperationPolicy:
+      type: object
+      required: [id, operationType, policyVersion, status, maxAttempts, timeoutMs]
+      properties:
+        id: { type: string, format: uuid }
+        operationType: { $ref: '#/components/schemas/OperationType' }
+        policyVersion: { type: integer, minimum: 1 }
+        status: { type: string, enum: [DRAFT, PENDING_APPROVAL, ACTIVE, RETIRED] }
+        maxAttempts: { type: integer, minimum: 1, maximum: 5 }
+        timeoutMs: { type: integer, minimum: 100, maximum: 30000 }
+    ReconciliationCase:
+      type: object
+      additionalProperties: false
+      required: [id, reversalCommandId, status, ambiguityReasonCode, openedAt]
+      properties:
+        id: { type: string, format: uuid }
+        reversalCommandId: { type: string, format: uuid }
+        status: { type: string, enum: [OPEN, EVIDENCE_PENDING, DECISION_PROPOSED, RESOLVED, QUARANTINED] }
+        ambiguityReasonCode: { type: string, maxLength: 64 }
+        proposedDecision: { type: [string, 'null'], enum: [CONFIRM_EXECUTED, CONFIRM_NOT_EXECUTED, REJECT, QUARANTINE, null] }
+        makerPseudonym:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{24}$'
+          description: Irreversible pseudonym of the proposing operator; never a raw identity.
+        proposalPurpose:
+          type: [string, 'null']
+          minLength: 8
+          maxLength: 160
+          description: Review-safe purpose supplied by the maker.
+        evidenceDigest:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+          description: SHA-256 digest of tenant- and case-owned evidence; never raw evidence.
+        openedAt: { type: string, format: date-time }
+        resolvedAt: { type: [string, 'null'], format: date-time }
+    ReconciliationDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [decision, purpose, evidenceDigest]
+      properties:
+        decision: { type: string, enum: [CONFIRM_EXECUTED, CONFIRM_NOT_EXECUTED, REJECT, QUARANTINE] }
+        purpose: { type: string, minLength: 8, maxLength: 160 }
+        evidenceDigest: { type: string, pattern: '^[a-f0-9]{64}$' }
+    ReconciliationApprovalRequest:
+      type: object
+      additionalProperties: false
+      required: [purpose]
+      properties:
+        purpose: { type: string, minLength: 8, maxLength: 160 }
+    AuditEvidence:
+      type: object
+      required: [eventId, action, outcome, actorPseudonym, purpose, correlationId, occurredAt, digest]
+      properties:
+        eventId: { type: string, format: uuid }
+        action: { type: string }
+        outcome: { type: string }
+        actorPseudonym: { type: string }
+        purpose: { type: string }
+        correlationId: { type: string, format: uuid }
+        occurredAt: { type: string, format: date-time }
+        digest: { type: string, pattern: '^[a-f0-9]{64}$' }
+    Problem:
+      type: object
+      additionalProperties: true
+      required: [type, title, status, code, correlationId]
+      properties:
+        type: { type: string, format: uri-reference }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string, maxLength: 500 }
+        instance: { type: string, format: uri-reference }
+        code:
+          type: string
+          enum:
+            - INVALID_REQUEST
+            - REVERSAL_NOT_ELIGIBLE
+            - REVERSAL_ALREADY_EXISTS
+            - IDEMPOTENCY_KEY_REUSED
+            - POLICY_NOT_ACTIVE
+            - STATE_TRANSITION_NOT_ALLOWED
+            - TENANT_SCOPE_MISMATCH
+            - RECONCILIATION_APPROVER_CONFLICT
+            - AUTHENTICATION_REQUIRED
+            - ACCESS_DENIED
+            - RESOURCE_NOT_FOUND
+            - RATE_LIMITED
+            - DEPENDENCY_UNAVAILABLE
+            - INTERNAL_ERROR
+        correlationId: { type: string, format: uuid }
+        fieldErrors:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }

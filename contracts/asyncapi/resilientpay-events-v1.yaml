@@ -1,0 +1,188 @@
+asyncapi: 3.0.0
+info:
+  title: ResilientPay Reversal Orchestrator Events
+  version: 0.1.0
+  description: >-
+    Clean-room RabbitMQ event catalogue. Delivery is at least once; stable message
+    identifiers and the inbox make duplicate delivery harmless.
+servers:
+  localRabbit:
+    host: localhost:5672
+    protocol: amqp
+    description: Synthetic local RabbitMQ broker
+channels:
+  reversalLifecycle:
+    address: resilientpay.reversal.lifecycle.v1
+    messages:
+      reversalAccepted:
+        $ref: '#/components/messages/ReversalAccepted'
+      reversalExecutionRequested:
+        $ref: '#/components/messages/ReversalExecutionRequested'
+      reversalOutcomeObserved:
+        $ref: '#/components/messages/ReversalOutcomeObserved'
+      originalTransactionStatusChanged:
+        $ref: '#/components/messages/OriginalTransactionStatusChanged'
+  reversalQuarantine:
+    address: resilientpay.reversal.quarantine.v1
+    messages:
+      quarantinedMessage:
+        $ref: '#/components/messages/QuarantinedMessage'
+  reversalDeadLetter:
+    address: resilientpay.reversal.dead-letter.v1
+    description: >-
+      Internal operator-only dead-letter exchange. It receives the original raw
+      broker delivery after bounded consumer retries; it does not carry the safe
+      QuarantinedMessage wrapper and must never be exposed as an application API.
+    messages:
+      rawDeadLetteredDelivery:
+        $ref: '#/components/messages/RawDeadLetteredDelivery'
+operations:
+  publishLifecycle:
+    action: send
+    channel:
+      $ref: '#/channels/reversalLifecycle'
+  consumeLifecycle:
+    action: receive
+    channel:
+      $ref: '#/channels/reversalLifecycle'
+  consumeQuarantine:
+    action: receive
+    channel:
+      $ref: '#/channels/reversalQuarantine'
+  consumeRawDeadLetter:
+    action: receive
+    channel:
+      $ref: '#/channels/reversalDeadLetter'
+components:
+  messages:
+    ReversalAccepted:
+      name: ReversalAccepted.v1
+      title: A reversal command was durably accepted
+      headers:
+        $ref: '#/components/schemas/EnvelopeHeaders'
+      payload:
+        $ref: '#/components/schemas/ReversalAcceptedPayload'
+    ReversalExecutionRequested:
+      name: ReversalExecutionRequested.v1
+      title: A bounded execution attempt is ready
+      headers:
+        $ref: '#/components/schemas/EnvelopeHeaders'
+      payload:
+        $ref: '#/components/schemas/ExecutionRequestedPayload'
+    ReversalOutcomeObserved:
+      name: ReversalOutcomeObserved.v1
+      title: A synthetic downstream outcome was observed
+      headers:
+        $ref: '#/components/schemas/EnvelopeHeaders'
+      payload:
+        $ref: '#/components/schemas/OutcomePayload'
+    OriginalTransactionStatusChanged:
+      name: OriginalTransactionStatusChanged.v1
+      title: A synthetic original transaction changed lifecycle status
+      headers:
+        $ref: '#/components/schemas/EnvelopeHeaders'
+      payload:
+        $ref: '#/components/schemas/OriginalTransactionStatusChangedPayload'
+    QuarantinedMessage:
+      name: QuarantinedMessage.v1
+      title: An invalid or persistently ambiguous message needs operator action
+      headers:
+        $ref: '#/components/schemas/EnvelopeHeaders'
+      payload:
+        $ref: '#/components/schemas/QuarantinePayload'
+    RawDeadLetteredDelivery:
+      name: RawDeadLetteredDelivery.v1
+      title: An exhausted original broker delivery retained for restricted operator inspection
+      contentType: application/octet-stream
+      description: >-
+        The body and headers are the original untrusted delivery, not a normalized
+        ResilientPay envelope. Consumers must treat both as opaque and potentially
+        malformed; the application-facing safe metadata projection is QuarantinedMessage.v1.
+      headers:
+        $ref: '#/components/schemas/OpaqueDeadLetterHeaders'
+      payload:
+        type: string
+        contentEncoding: base64
+        maxLength: 21848
+  schemas:
+    EnvelopeHeaders:
+      type: object
+      additionalProperties: false
+      required: [messageId, correlationId, causationId, schemaVersion, tenantId, signatureKeyId, signature]
+      dependentRequired:
+        tracestate: [traceparent]
+      properties:
+        messageId: { type: string, format: uuid }
+        correlationId: { type: string, format: uuid }
+        causationId: { type: string, format: uuid }
+        schemaVersion: { type: string, const: '1' }
+        tenantId: { type: string, format: uuid }
+        signatureKeyId: { type: string, maxLength: 32 }
+        signature: { type: string, pattern: '^[a-f0-9]{64}$' }
+        traceparent:
+          type: string
+          pattern: '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+          maxLength: 55
+          description: Optional W3C trace context propagated durably through the outbox.
+        tracestate:
+          type: string
+          maxLength: 512
+          description: Optional W3C vendor trace state; valid only when traceparent is present.
+    OpaqueDeadLetterHeaders:
+      type: object
+      maxProperties: 64
+      additionalProperties: true
+      description: >-
+        Original untrusted broker headers retained only at the restricted dead-letter
+        boundary. No application envelope validity is implied.
+    ReversalAcceptedPayload:
+      type: object
+      additionalProperties: false
+      required: [reversalCommandId, operationType, policyVersion, acceptedAt]
+      properties:
+        reversalCommandId: { type: string, format: uuid }
+        operationType: { type: string, enum: [CARD_PURCHASE, ACCOUNT_TRANSFER, CASH_WITHDRAWAL, MERCHANT_PAYOUT] }
+        policyVersion: { type: integer, minimum: 1 }
+        acceptedAt: { type: string, format: date-time }
+    ExecutionRequestedPayload:
+      type: object
+      additionalProperties: false
+      required: [reversalCommandId, executionAttemptId, attemptNumber, deadline]
+      properties:
+        reversalCommandId: { type: string, format: uuid }
+        executionAttemptId: { type: string, format: uuid }
+        attemptNumber: { type: integer, minimum: 1, maximum: 5 }
+        deadline: { type: string, format: date-time }
+        demonstrationFailure:
+          type: string
+          enum: [NONE, INTERRUPT_ONCE, AMBIGUOUS, REJECT]
+          default: NONE
+          description: Synthetic local-demo fault selection; producers omit it outside demo profiles.
+    OutcomePayload:
+      type: object
+      additionalProperties: false
+      required: [reversalCommandId, executionAttemptId, outcome, observedAt]
+      properties:
+        reversalCommandId: { type: string, format: uuid }
+        executionAttemptId: { type: string, format: uuid }
+        outcome: { type: string, enum: [EXECUTED, CONFIRMED_NOT_EXECUTED, REJECTED, AMBIGUOUS] }
+        reasonCode: { type: [string, 'null'], maxLength: 64 }
+        observedAt: { type: string, format: date-time }
+    OriginalTransactionStatusChangedPayload:
+      type: object
+      additionalProperties: false
+      required: [originalTransactionId, status, changedAt]
+      properties:
+        originalTransactionId: { type: string, format: uuid }
+        status: { type: string, enum: [POSTED, REVERSAL_RESERVED, REVERSED] }
+        changedAt: { type: string, format: date-time }
+        reversalCommandId: { type: string, format: uuid }
+    QuarantinePayload:
+      type: object
+      additionalProperties: false
+      required: [originalMessageId, safeReasonCode, payloadDigest, quarantinedAt]
+      properties:
+        originalMessageId: { type: string, format: uuid }
+        safeReasonCode: { type: string, maxLength: 64 }
+        payloadDigest: { type: string, pattern: '^[a-f0-9]{64}$' }
+        quarantinedAt: { type: string, format: date-time }
