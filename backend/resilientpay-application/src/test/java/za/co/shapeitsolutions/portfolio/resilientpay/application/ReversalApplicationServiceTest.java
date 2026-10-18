@@ -1,7 +1,10 @@
 package za.co.shapeitsolutions.portfolio.resilientpay.application;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
@@ -10,6 +13,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ActorContext;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ApplicationErrorCode;
@@ -17,6 +21,7 @@ import za.co.shapeitsolutions.portfolio.resilientpay.application.model.Applicati
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.MutationAdmissionPort;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OrchestrationStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.SecurityAuditPort;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.TransactionBoundary;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.service.ReversalApplicationService;
 import za.co.shapeitsolutions.portfolio.resilientpay.domain.shared.ActorId;
 import za.co.shapeitsolutions.portfolio.resilientpay.domain.shared.TenantId;
@@ -188,6 +193,113 @@ class ReversalApplicationServiceTest {
         assertEquals(0, storeCalls.get());
     }
 
+    @Test
+    void everyMutationOwnsOneWriteScopeAfterAdmission() {
+        RecordingTransactions transactions = new RecordingTransactions();
+        OrchestrationStore store = proxy((method, arguments) -> {
+            assertTrue(transactions.active);
+            assertEquals("required", transactions.current);
+            transactions.order.add(method);
+            return null;
+        });
+        ReversalApplicationService service = new ReversalApplicationService(
+                store,
+                (tenant, action) -> {
+                    assertFalse(transactions.active);
+                    transactions.order.add("admission");
+                },
+                noOpAudit(),
+                transactions,
+                APPROVAL_ASSURANCE);
+        service.accept(actor("SCOPE_reversals.write"), null);
+        service.retry(actor("SCOPE_reversals.retry"), null);
+        service.ingestOriginal(actor("SCOPE_transactions.write"), null);
+        service.propose(actor("SCOPE_reconciliation.decide"), null);
+        service.approve(actor("SCOPE_reconciliation.approve", APPROVAL_ASSURANCE), null);
+        List<String> expected = new ArrayList<>();
+        for (String method : List.of("accept", "retry", "ingestOriginal", "propose", "approve")) {
+            expected.addAll(List.of("admission", "begin-required", method, "end-required"));
+        }
+        assertEquals(expected, transactions.order);
+    }
+
+    @Test
+    void everyQueryOwnsOneReadOnlyScopeAndEvidenceAuditRunsAfterIt() {
+        RecordingTransactions transactions = new RecordingTransactions();
+        OrchestrationStore store = proxy((method, arguments) -> {
+            assertTrue(transactions.active);
+            assertEquals("readOnly", transactions.current);
+            return "getReversal".equals(method) ? null : List.of();
+        });
+        SecurityAuditPort audit = new SecurityAuditPort() {
+            @Override
+            public void recordAuthorizationDenied(
+                    ActorContext actor, String action, UUID resource, UUID correlation, String reason) {
+                throw new AssertionError("No authorized query should be denied");
+            }
+
+            @Override
+            public void recordEvidenceViewed(ActorContext actor, UUID resource, UUID correlation) {
+                assertFalse(transactions.active);
+                transactions.order.add("independent-evidence");
+            }
+        };
+        ReversalApplicationService service = new ReversalApplicationService(
+                store,
+                (tenant, action) -> {
+                    throw new AssertionError("Queries do not consume admission");
+                },
+                audit,
+                transactions,
+                APPROVAL_ASSURANCE);
+        service.listReversals(actor("SCOPE_reversals.read"), null, 50);
+        service.getReversal(actor("SCOPE_reversals.read"), UUID.randomUUID());
+        service.listOriginals(actor("SCOPE_transactions.read"));
+        service.listPolicies(actor("SCOPE_policies.read"));
+        service.listReconciliationCases(actor("SCOPE_reconciliation.read"));
+        service.evidence(actor("SCOPE_audit.read"), UUID.randomUUID());
+        assertEquals(
+                6, transactions.order.stream().filter("begin-readOnly"::equals).count());
+        assertEquals("independent-evidence", transactions.order.getLast());
+    }
+
+    @Test
+    void authorizationAndAdmissionFailuresNeverOpenDatabaseScope() {
+        RecordingTransactions transactions = new RecordingTransactions();
+        ReversalApplicationService service = new ReversalApplicationService(
+                proxy((method, arguments) -> {
+                    throw new AssertionError("Store must not be invoked");
+                }),
+                (tenant, action) -> {
+                    throw new IllegalStateException("synthetic admission outage");
+                },
+                noOpAudit(),
+                transactions,
+                APPROVAL_ASSURANCE);
+        assertThrows(ApplicationException.class, () -> service.retry(actor("SCOPE_reversals.read"), null));
+        assertThrows(IllegalStateException.class, () -> service.retry(actor("SCOPE_reversals.retry"), null));
+        assertTrue(transactions.order.isEmpty());
+    }
+
+    @Test
+    void storeFailurePropagatesThroughOwnedScopeWithoutSuccess() {
+        RecordingTransactions transactions = new RecordingTransactions();
+        IllegalStateException expected = new IllegalStateException("synthetic persistence failure");
+        ReversalApplicationService service = new ReversalApplicationService(
+                proxy((method, arguments) -> {
+                    throw expected;
+                }),
+                (tenant, action) -> {},
+                noOpAudit(),
+                transactions,
+                APPROVAL_ASSURANCE);
+        assertSame(
+                expected,
+                assertThrows(IllegalStateException.class, () -> service.retry(actor("SCOPE_reversals.retry"), null)));
+        assertFalse(transactions.active);
+        assertEquals(List.of("begin-required", "end-required"), transactions.order);
+    }
+
     private static ActorContext actor(String authority) {
         return new ActorContext(TENANT, new ActorId("subject-123"), Set.of(authority));
     }
@@ -202,7 +314,47 @@ class ReversalApplicationServiceTest {
 
     private static ReversalApplicationService service(
             OrchestrationStore store, MutationAdmissionPort admission, SecurityAuditPort audit) {
-        return new ReversalApplicationService(store, admission, audit, APPROVAL_ASSURANCE);
+        return new ReversalApplicationService(store, admission, audit, new RecordingTransactions(), APPROVAL_ASSURANCE);
+    }
+
+    /**
+     * Observes application-selected scope and ordering without pretending to exercise a database.
+     *
+     * @author Daniel Jr Nkulu
+     */
+    private static final class RecordingTransactions implements TransactionBoundary {
+        private final List<String> order = new ArrayList<>();
+        private boolean active;
+        private String current;
+
+        @Override
+        public <T> T required(Supplier<T> work) {
+            return execute("required", work);
+        }
+
+        @Override
+        public <T> T readOnly(Supplier<T> work) {
+            return execute("readOnly", work);
+        }
+
+        @Override
+        public <T> T requiresNew(Supplier<T> work) {
+            return execute("requiresNew", work);
+        }
+
+        private <T> T execute(String mode, Supplier<T> work) {
+            assertFalse(active);
+            order.add("begin-" + mode);
+            active = true;
+            current = mode;
+            try {
+                return work.get();
+            } finally {
+                active = false;
+                current = null;
+                order.add("end-" + mode);
+            }
+        }
     }
 
     private static OrchestrationStore proxy(Invocation invocation) {

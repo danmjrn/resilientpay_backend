@@ -16,6 +16,8 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.in.OutboxOperations;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ConditionalOnRuntimeRole;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.MessagingProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProperties;
@@ -33,10 +35,9 @@ public final class RabbitOutboxPublisher {
     private static final String ACCEPTED_EVENT = "ReversalAccepted.v1";
     private static final String ORIGINAL_STATUS_EVENT = "OriginalTransactionStatusChanged.v1";
 
-    private final PostgresOutboxRepository repository;
+    private final OutboxOperations operations;
     private final RabbitTemplate rabbitTemplate;
     private final MessageIntegrity integrity;
-    private final OutboxPublicationAudit publicationAudit;
     private final MessagingProperties messaging;
     private final Duration confirmTimeout;
     private final MeterRegistry meterRegistry;
@@ -45,28 +46,25 @@ public final class RabbitOutboxPublisher {
     /**
      * Creates the confirmed outbox relay.
      *
-     * @param repository transactional lease repository
+     * @param operations application-owned short lease transitions
      * @param rabbitTemplate confirmed RabbitMQ publisher
      * @param integrity envelope and body integrity boundary
-     * @param publicationAudit append-only confirmed publication evidence
      * @param messaging topology and wire limits
      * @param outbox bounded publication settings
      * @param meterRegistry low-cardinality publication metrics
      * @param traceContext W3C message trace propagation
      */
     public RabbitOutboxPublisher(
-            PostgresOutboxRepository repository,
+            OutboxOperations operations,
             RabbitTemplate rabbitTemplate,
             MessageIntegrity integrity,
-            OutboxPublicationAudit publicationAudit,
             MessagingProperties messaging,
             OutboxProperties outbox,
             MeterRegistry meterRegistry,
             RabbitTraceContext traceContext) {
-        this.repository = Objects.requireNonNull(repository, "repository must not be null");
+        this.operations = Objects.requireNonNull(operations, "operations must not be null");
         this.rabbitTemplate = Objects.requireNonNull(rabbitTemplate, "rabbitTemplate must not be null");
         this.integrity = Objects.requireNonNull(integrity, "integrity must not be null");
-        this.publicationAudit = Objects.requireNonNull(publicationAudit, "publicationAudit must not be null");
         this.messaging = Objects.requireNonNull(messaging, "messaging must not be null");
         this.confirmTimeout =
                 Objects.requireNonNull(outbox, "outbox must not be null").confirmTimeout();
@@ -78,11 +76,11 @@ public final class RabbitOutboxPublisher {
     /** Publishes one bounded claimed batch. */
     @Scheduled(fixedDelayString = "${resilientpay.outbox.poll-delay:500ms}")
     public void publishDue() {
-        int recovered = repository.recoverDueDead();
+        int recovered = operations.recoverDueDead();
         if (recovered > 0) {
             meterRegistry.counter("resilientpay.outbox.recovered").increment(recovered);
         }
-        for (OutboxMessage message : repository.claimDue()) {
+        for (OutboxMessage message : operations.claimDue()) {
             publish(message);
         }
     }
@@ -91,14 +89,14 @@ public final class RabbitOutboxPublisher {
         // Only execution requests carry a dispatch-relative deadline. Avoid opening an otherwise
         // empty database transaction for the four lifecycle events produced by each happy path.
         if (EXECUTION_EVENT.equals(outbox.eventType())) {
-            outbox = repository.prepareForPublish(outbox);
+            outbox = operations.prepareForPublish(outbox);
         }
         if ((!EXECUTION_EVENT.equals(outbox.eventType())
                         && !ACCEPTED_EVENT.equals(outbox.eventType())
                         && !ORIGINAL_STATUS_EVENT.equals(outbox.eventType()))
                 || outbox.schemaVersion() != 1
                 || outbox.payload().length > messaging.maximumPayloadBytes()) {
-            repository.markFailed(outbox, "UNSUPPORTED_OUTBOX_EVENT", false);
+            operations.markFailed(outbox, "UNSUPPORTED_OUTBOX_EVENT", false);
             meterRegistry
                     .counter("resilientpay.outbox.dead", "reason", "invalid-event")
                     .increment();
@@ -141,25 +139,24 @@ public final class RabbitOutboxPublisher {
             CorrelationData.Confirm confirm =
                     correlation.getFuture().get(confirmTimeout.toMillis(), TimeUnit.MILLISECONDS);
             if (!confirm.ack() || correlation.getReturned() != null) {
-                repository.markFailed(outbox, "BROKER_REJECTED", true);
+                operations.markFailed(outbox, "BROKER_REJECTED", true);
                 meterRegistry
                         .counter("resilientpay.outbox.publish", "outcome", "rejected")
                         .increment();
                 return;
             }
-            publicationAudit.recordPublished(outbox);
-            repository.markPublished(outbox);
+            operations.confirmPublished(outbox);
             meterRegistry
                     .counter("resilientpay.outbox.publish", "outcome", "confirmed")
                     .increment();
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            repository.markFailed(outbox, "PUBLISH_INTERRUPTED", true);
+            operations.markFailed(outbox, "PUBLISH_INTERRUPTED", true);
             meterRegistry
                     .counter("resilientpay.outbox.publish", "outcome", "interrupted")
                     .increment();
         } catch (AmqpException | ExecutionException | TimeoutException exception) {
-            repository.markFailed(outbox, "BROKER_UNAVAILABLE", true);
+            operations.markFailed(outbox, "BROKER_UNAVAILABLE", true);
             meterRegistry
                     .counter("resilientpay.outbox.publish", "outcome", "unavailable")
                     .increment();

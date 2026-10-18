@@ -28,21 +28,24 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
-import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.IllegalTransactionStateException;
+import org.springframework.transaction.annotation.AnnotationTransactionAttributeSource;
+import org.springframework.transaction.interceptor.TransactionInterceptor;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutboxMessage;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutcomeObservation;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.PostgresOutboxRepository;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.QuarantineMetrics;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.RabbitTraceContext;
@@ -54,9 +57,15 @@ import za.co.shapeitsolutions.portfolio.resilientpay.application.model.Applicati
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ApproveReconciliationCommand;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.AuditEvidenceView;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.DemonstrationFailure;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutcomeObservation;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ProposeReconciliationCommand;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ReconciliationCaseView;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.RetryReversalCommand;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.AuditStore;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.IndependentAuditPort;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.AuditApplicationService;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.ReversalApplicationService;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ReconciliationProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ResilientPaySecurityProperties;
@@ -90,6 +99,12 @@ class PostgresOrchestrationStoreIT {
     private static JdbcTemplate jdbc;
     private static TransactionTemplate transactions;
     private static PostgresOrchestrationStore store;
+    private static DataSourceTransactionManager transactionManager;
+    private static SpringTransactionBoundary boundary;
+    private static PostgresAuditStore auditStore;
+    private static AuditApplicationService securityAudit;
+    private static WorkflowMetrics metrics;
+    private static QuarantineMetrics quarantineMetrics;
 
     @BeforeAll
     static void configureStore() {
@@ -101,21 +116,194 @@ class PostgresOrchestrationStoreIT {
                 .load()
                 .migrate();
         jdbc = new JdbcTemplate(dataSource);
-        transactions = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
-        TransactionTemplate independentAudit = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
-        independentAudit.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        transactionManager = new DataSourceTransactionManager(dataSource);
+        transactions = new TransactionTemplate(transactionManager);
+        boundary = new SpringTransactionBoundary(transactionManager);
         SimpleMeterRegistry meters = new SimpleMeterRegistry();
-        store = new PostgresOrchestrationStore(
+        metrics = new WorkflowMetrics(meters);
+        quarantineMetrics = new QuarantineMetrics(meters);
+        auditStore = new PostgresAuditStore(
+                jdbc,
+                new ResilientPaySecurityProperties(
+                        "resilientpay-api", "postgres-it-evidence-key", "postgres-it-v1", "urn:resilientpay:acr:mfa"),
+                metrics);
+        securityAudit = new AuditApplicationService(auditStore, boundary, Clock.systemUTC());
+        store = createStore(auditStore, securityAudit);
+    }
+
+    private static PostgresOrchestrationStore createStore(AuditStore writer, IndependentAuditPort independentAudit) {
+        return new PostgresOrchestrationStore(
                 jdbc,
                 Clock.systemUTC(),
                 new ReconciliationProperties(Duration.ofSeconds(5), 25, Duration.ofHours(24)),
-                new ResilientPaySecurityProperties(
-                        "resilientpay-api", "postgres-it-evidence-key", "postgres-it-v1", "urn:resilientpay:acr:mfa"),
-                new WorkflowMetrics(meters),
-                new QuarantineMetrics(meters),
+                writer,
+                metrics,
+                quarantineMetrics,
                 new RabbitTraceContext(Tracer.NOOP, Propagator.NOOP),
                 independentAudit,
                 new RuntimeMode(true));
+    }
+
+    @Test
+    void applicationEntryRollsBackEveryAcceptanceWriteWhenLateAuditFails() {
+        String token = "synth-application-rollback-0001";
+        UUID originalId = insertSyntheticOriginal(token, OperationType.CARD_PURCHASE, "120");
+        UUID correlationId = UUID.randomUUID();
+        String key = "idempotency-application-rollback-0001";
+        AtomicReference<UUID> attemptedCommand = new AtomicReference<>();
+        AuditStore failingLateWriter = entry -> {
+            assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
+            auditStore.append(entry);
+            if ("REVERSAL_ROUTED".equals(entry.action())) {
+                attemptedCommand.set(entry.resourceId());
+                assertEquals(3, outboxCount(correlationId));
+                assertEquals(
+                        2,
+                        jdbc.queryForObject(
+                                "SELECT COUNT(*) FROM audit_event WHERE correlation_id = ?",
+                                Integer.class,
+                                correlationId));
+                throw new IllegalStateException("synthetic failure after all acceptance writes");
+            }
+        };
+        ReversalApplicationService application =
+                application(createStore(failingLateWriter, securityAudit), securityAudit);
+
+        assertThrows(
+                IllegalStateException.class,
+                () -> application.accept(
+                        applicationActor(), acceptance(token, OperationType.CARD_PURCHASE, "120", key, correlationId)));
+
+        UUID commandId = attemptedCommand.get();
+        assertTrue(commandId != null, "Failure injection must happen after the real acceptance writes");
+        assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+        assertEquals("POSTED", originalState(originalId));
+        assertEquals(
+                0L,
+                jdbc.queryForObject("SELECT version FROM original_transaction WHERE id = ?", Long.class, originalId));
+        assertEquals(
+                0, jdbc.queryForObject("SELECT COUNT(*) FROM reversal_command WHERE id = ?", Integer.class, commandId));
+        assertEquals(
+                0,
+                jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM reversal_reservation WHERE original_transaction_id = ?",
+                        Integer.class,
+                        originalId));
+        assertEquals(
+                0,
+                jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM execution_attempt WHERE reversal_command_id = ?",
+                        Integer.class,
+                        commandId));
+        assertEquals(
+                0,
+                jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM idempotency_record WHERE key_hash = ?", Integer.class, sha256(key)));
+        assertEquals(0, outboxCount(correlationId));
+        assertEquals(
+                0,
+                jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM audit_event WHERE correlation_id = ?", Integer.class, correlationId));
+    }
+
+    @Test
+    void applicationDenialCommitsIndependentlyAndSurvivesEnclosingRollback() {
+        String token = "synth-application-denial-0001";
+        UUID originalId = insertSyntheticOriginal(token, OperationType.CARD_PURCHASE, "120");
+        AtomicReference<Long> denialTransaction = new AtomicReference<>();
+        AuditApplicationService observedAudit = new AuditApplicationService(
+                entry -> {
+                    if ("IDEMPOTENCY_KEY_REUSE_DENIED".equals(entry.action())) {
+                        denialTransaction.set(jdbc.queryForObject("SELECT txid_current()", Long.class));
+                    }
+                    auditStore.append(entry);
+                },
+                boundary,
+                Clock.systemUTC());
+        ReversalApplicationService application = application(createStore(auditStore, observedAudit), observedAudit);
+        AcceptReversalCommand request = acceptance(
+                token, OperationType.CARD_PURCHASE, "120", "idempotency-application-denial-0001", UUID.randomUUID());
+        AcceptanceResult accepted = application.accept(applicationActor(), request);
+        AcceptReversalCommand changed = new AcceptReversalCommand(
+                token,
+                request.operationType(),
+                request.money(),
+                new ReversalReason("Changed synthetic request"),
+                request.demonstrationFailure(),
+                request.idempotencyKey(),
+                new CorrelationId(UUID.randomUUID()));
+        Long originalVersion =
+                jdbc.queryForObject("SELECT version FROM original_transaction WHERE id = ?", Long.class, originalId);
+        AtomicReference<Long> enclosingTransaction = new AtomicReference<>();
+
+        ApplicationException failure = assertThrows(
+                ApplicationException.class,
+                () -> boundary.required(() -> {
+                    enclosingTransaction.set(jdbc.queryForObject("SELECT txid_current()", Long.class));
+                    jdbc.update("UPDATE original_transaction SET version = version + 1 WHERE id = ?", originalId);
+                    application.accept(applicationActor(), changed);
+                }));
+
+        assertEquals(ApplicationErrorCode.IDEMPOTENCY_KEY_REUSED, failure.code());
+        assertTrue(denialTransaction.get() != null);
+        assertNotEquals(enclosingTransaction.get(), denialTransaction.get());
+        assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+        assertEquals(
+                originalVersion,
+                jdbc.queryForObject("SELECT version FROM original_transaction WHERE id = ?", Long.class, originalId));
+        assertEquals(
+                1,
+                jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM reversal_command WHERE original_transaction_id = ?",
+                        Integer.class,
+                        originalId));
+        assertEquals(3, logicalOutboxCount(originalId, accepted.command().id()));
+        assertEquals(
+                1, jdbc.queryForObject("""
+                SELECT COUNT(*) FROM audit_event
+                WHERE resource_id = ? AND action = 'IDEMPOTENCY_KEY_REUSE_DENIED'
+                  AND outcome = 'DENIED' AND reason_code = 'IDEMPOTENCY_KEY_REUSED'
+                """, Integer.class, accepted.command().id()));
+    }
+
+    @Test
+    void mandatoryPersistenceGuardsRejectCallsWithoutAnApplicationTransaction() {
+        TransactionInterceptor interceptor = new TransactionInterceptor();
+        interceptor.setTransactionManager(transactionManager);
+        interceptor.setTransactionAttributeSource(new AnnotationTransactionAttributeSource());
+        ProxyFactory storeFactory = new ProxyFactory(store);
+        storeFactory.setProxyTargetClass(true);
+        storeFactory.addAdvice(interceptor);
+        PostgresOrchestrationStore guardedStore = (PostgresOrchestrationStore) storeFactory.getProxy();
+        assertThrows(IllegalTransactionStateException.class, () -> guardedStore.listPolicies(TENANT));
+        ProxyFactory auditFactory = new ProxyFactory(auditStore);
+        auditFactory.setProxyTargetClass(true);
+        auditFactory.addAdvice(interceptor);
+        AuditStore guardedAudit = (AuditStore) auditFactory.getProxy();
+        assertThrows(IllegalTransactionStateException.class, () -> guardedAudit.append(null));
+        assertFalse(application(guardedStore, securityAudit)
+                .listPolicies(applicationActor())
+                .isEmpty());
+    }
+
+    private static ReversalApplicationService application(
+            PostgresOrchestrationStore applicationStore, AuditApplicationService audit) {
+        return new ReversalApplicationService(
+                applicationStore,
+                (tenant, action) -> {
+                    // The primary entry test has no enclosing unit; the suspension test deliberately does.
+                    assertEquals(TENANT, tenant);
+                },
+                audit,
+                boundary,
+                "urn:resilientpay:acr:mfa");
+    }
+
+    private static ActorContext applicationActor() {
+        return new ActorContext(
+                TENANT,
+                new ActorId("application-boundary-operator"),
+                Set.of("SCOPE_reversals.write", "SCOPE_policies.read"));
     }
 
     @Test

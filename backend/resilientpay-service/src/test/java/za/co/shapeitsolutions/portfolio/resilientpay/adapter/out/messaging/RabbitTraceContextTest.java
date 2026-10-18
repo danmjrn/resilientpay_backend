@@ -47,6 +47,7 @@ import org.springframework.core.env.Environment;
 import org.springframework.mock.env.MockEnvironment;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxTraceContext;
 
 /**
  * Verifies explicit W3C correlation and bounded trace-header handling without a broker.

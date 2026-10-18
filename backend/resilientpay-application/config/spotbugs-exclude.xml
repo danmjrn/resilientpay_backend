@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter>
+  <!-- SA-001: this private final field deliberately retains an injected effectful port,
+       not caller-owned value state. Copying the persistence collaborator is undefined.
+       Exact reviewed scope and re-review triggers: docs/testing/skip-register.md. -->
+  <Match>
+    <Bug pattern="EI_EXPOSE_REP2"/>
+    <Class name="za.co.shapeitsolutions.portfolio.resilientpay.application.service.AuditApplicationService"/>
+    <Method name="&lt;init&gt;" params="za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.AuditStore,za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.TransactionBoundary,java.time.Clock" returns="void"/>
+    <Field name="store" type="za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.AuditStore"/>
+  </Match>
+</FindBugsFilter>

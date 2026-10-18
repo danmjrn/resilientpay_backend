@@ -13,6 +13,8 @@ import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcOperations;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxTraceContext;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProperties;
 
 /**

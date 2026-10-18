@@ -1,13 +1,18 @@
 package za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.flywaydb.core.Flyway;
@@ -15,15 +20,25 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.jdbc.support.JdbcTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.LifecycleProjectionStore;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutboxMessage;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutboxRecoveryAudit;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.PostgresLifecycleProjectionStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.PostgresOutboxRepository;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ActorContext;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.AuditEntry;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.in.OutboxOperations;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.LifecycleProjectionStore;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OutboxRecoveryAudit;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.TransactionBoundary;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.OutboxApplicationService;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProperties;
+import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ResilientPaySecurityProperties;
+import za.co.shapeitsolutions.portfolio.resilientpay.domain.shared.ActorId;
+import za.co.shapeitsolutions.portfolio.resilientpay.domain.shared.TenantId;
 
 /**
  * Verifies the canonical PostgreSQL 18 schema, repeatable demo seed, and outbox lease SQL.
@@ -36,6 +51,7 @@ class DemoFlywayIT {
     private static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:18.4-alpine");
 
     private static JdbcTemplate jdbc;
+    private static TransactionBoundary transactions;
 
     @BeforeAll
     static void migrate() {
@@ -47,6 +63,7 @@ class DemoFlywayIT {
                 .load()
                 .migrate();
         jdbc = new JdbcTemplate(dataSource);
+        transactions = new SpringTransactionBoundary(new JdbcTransactionManager(dataSource));
     }
 
     @Test
@@ -104,18 +121,7 @@ class DemoFlywayIT {
                 Timestamp.from(now),
                 Timestamp.from(now));
         AtomicInteger recoveries = new AtomicInteger();
-        PostgresOutboxRepository repository = new PostgresOutboxRepository(
-                jdbc,
-                Clock.fixed(now.plusSeconds(1), java.time.ZoneOffset.UTC),
-                new OutboxProperties(
-                        10,
-                        Duration.ofSeconds(30),
-                        Duration.ofMillis(500),
-                        3,
-                        Duration.ofSeconds(5),
-                        Duration.ofMinutes(5),
-                        3),
-                (message, recoveryCount) -> recoveries.incrementAndGet());
+        OutboxOperations repository = repositoryAt(now.plusSeconds(1), recoveries);
 
         List<OutboxMessage> claimed = repository.claimDue();
         repository.markFailed(claimed.getFirst(), "PERMANENT_TEST_FAILURE", false);
@@ -153,15 +159,15 @@ class DemoFlywayIT {
                 Timestamp.from(acceptedAt));
         AtomicInteger recoveries = new AtomicInteger();
 
-        PostgresOutboxRepository first = repositoryAt(acceptedAt.plusSeconds(1), recoveries);
+        OutboxOperations first = repositoryAt(acceptedAt.plusSeconds(1), recoveries);
         OutboxMessage firstAttempt = first.claimDue().getFirst();
         first.markFailed(firstAttempt, "BROKER_UNAVAILABLE", true);
 
-        PostgresOutboxRepository second = repositoryAt(acceptedAt.plusSeconds(2), recoveries);
+        OutboxOperations second = repositoryAt(acceptedAt.plusSeconds(2), recoveries);
         OutboxMessage secondAttempt = second.claimDue().getFirst();
         second.markFailed(secondAttempt, "BROKER_UNAVAILABLE", true);
 
-        PostgresOutboxRepository third = repositoryAt(acceptedAt.plusSeconds(4), recoveries);
+        OutboxOperations third = repositoryAt(acceptedAt.plusSeconds(4), recoveries);
         OutboxMessage thirdAttempt = third.claimDue().getFirst();
         third.markFailed(thirdAttempt, "BROKER_UNAVAILABLE", true);
 
@@ -169,10 +175,10 @@ class DemoFlywayIT {
         assertEquals(3, jdbc.queryForObject("SELECT attempt_count FROM outbox_event WHERE id = ?", Integer.class, id));
         assertEquals(0, repositoryAt(acceptedAt.plusSeconds(303), recoveries).recoverDueDead());
 
-        PostgresOutboxRepository recovered = repositoryAt(acceptedAt.plusSeconds(305), recoveries);
+        OutboxOperations recovered = repositoryAt(acceptedAt.plusSeconds(305), recoveries);
         assertEquals(1, recovered.recoverDueDead());
         List<OutboxMessage> recoveredClaim = recovered.claimDue();
-        recovered.markPublished(recoveredClaim.getFirst());
+        recovered.confirmPublished(recoveredClaim.getFirst());
 
         assertEquals(1, recoveries.get());
         assertEquals(1, recoveredClaim.size());
@@ -218,18 +224,20 @@ class DemoFlywayIT {
         OutboxRecoveryAudit audit = new OutboxRecoveryAudit() {
             @Override
             public void recordRecovered(OutboxMessage message, int recoveryCount) {
+                assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
                 recoveries.incrementAndGet();
             }
 
             @Override
             public void recordTerminalFailure(OutboxMessage message, int recoveryCount, String errorCode) {
+                assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
                 terminalFailures.incrementAndGet();
             }
         };
 
-        PostgresOutboxRepository initial = repositoryAt(acceptedAt.plusSeconds(1), audit, 1, 1);
+        OutboxOperations initial = repositoryAt(acceptedAt.plusSeconds(1), audit, 1, 1);
         initial.markFailed(initial.claimDue().getFirst(), "BROKER_UNAVAILABLE", true);
-        PostgresOutboxRepository recovered = repositoryAt(acceptedAt.plusSeconds(301), audit, 1, 1);
+        OutboxOperations recovered = repositoryAt(acceptedAt.plusSeconds(301), audit, 1, 1);
         assertEquals(1, recovered.recoverDueDead());
         recovered.markFailed(recovered.claimDue().getFirst(), "BROKER_UNAVAILABLE", true);
 
@@ -245,7 +253,9 @@ class DemoFlywayIT {
 
     @Test
     void lifecycleProjectionInboxDeduplicatesAndDetectsConflictingPayloads() {
-        PostgresLifecycleProjectionStore projection = new PostgresLifecycleProjectionStore(jdbc);
+        PostgresLifecycleProjectionStore rawProjection = new PostgresLifecycleProjectionStore(jdbc);
+        LifecycleProjectionStore projection = (tenant, message, hash, correlation, event, observed) ->
+                transactions.required(() -> rawProjection.record(tenant, message, hash, correlation, event, observed));
         UUID tenant = UUID.fromString("00000000-0000-0000-0000-000000000001");
         UUID messageId = UUID.randomUUID();
         UUID correlationId = UUID.randomUUID();
@@ -279,24 +289,164 @@ class DemoFlywayIT {
                         """, Integer.class, tenant, messageId));
     }
 
-    private static PostgresOutboxRepository repositoryAt(Instant now, AtomicInteger recoveries) {
-        return new PostgresOutboxRepository(
-                jdbc,
-                Clock.fixed(now, java.time.ZoneOffset.UTC),
-                new OutboxProperties(
-                        10,
-                        Duration.ofSeconds(30),
-                        Duration.ofMillis(500),
-                        3,
-                        Duration.ofSeconds(5),
-                        Duration.ofMinutes(5),
-                        3),
-                (message, recoveryCount) -> recoveries.incrementAndGet());
+    @Test
+    void confirmedAuditRemainsCommittedWhenPublishedStateTransactionRollsBack() {
+        Instant now = Instant.parse("2026-08-24T12:00:00Z");
+        UUID eventId = insertTransactionProbeEvent(now, "PENDING");
+        PostgresOutboxRepository raw =
+                new PostgresOutboxRepository(
+                        jdbc,
+                        Clock.fixed(now.plusSeconds(1), java.time.ZoneOffset.UTC),
+                        transactionProbeProperties(),
+                        (message, recoveryCount) -> {}) {
+                    @Override
+                    public void markPublished(OutboxMessage message) {
+                        super.markPublished(message);
+                        throw new IllegalStateException("synthetic failure after published-state write");
+                    }
+                };
+        OutboxOperations operations = new OutboxApplicationService(
+                transactions, raw, message -> appendTransactionProbeAudit(message, "PUBLICATION_CONFIRMED"));
+        try {
+            OutboxMessage claimed = operations.claimDue().getFirst();
+            assertEquals(eventId, claimed.id());
+
+            assertThrows(IllegalStateException.class, () -> operations.confirmPublished(claimed));
+
+            assertEquals(
+                    "CLAIMED",
+                    jdbc.queryForObject("SELECT status FROM outbox_event WHERE id = ?", String.class, eventId));
+            assertEquals(
+                    1,
+                    jdbc.queryForObject(
+                            "SELECT COUNT(*) FROM audit_event WHERE resource_id = ? AND action = 'PUBLICATION_CONFIRMED'",
+                            Integer.class,
+                            eventId));
+        } finally {
+            jdbc.update("DELETE FROM outbox_event WHERE id = ?", eventId);
+        }
     }
 
-    private static PostgresOutboxRepository repositoryAt(
+    @Test
+    void laterRecoveryAuditFailureRollsBackEarlierRecoveryAndAuditWritesInTheBatch() {
+        Instant now = Instant.parse("2026-08-24T13:00:00Z");
+        UUID first = insertTransactionProbeEvent(now, "DEAD");
+        UUID second = insertTransactionProbeEvent(now.plusMillis(1), "DEAD");
+        List<UUID> audited = new ArrayList<>();
+        OutboxRecoveryAudit audit = (message, recoveryCount) -> {
+            appendTransactionProbeAudit(message, "RECOVERY_PROBE");
+            audited.add(message.id());
+            if (message.id().equals(second)) {
+                assertEquals(
+                        "PENDING",
+                        jdbc.queryForObject("SELECT status FROM outbox_event WHERE id = ?", String.class, first));
+                assertEquals(
+                        1,
+                        jdbc.queryForObject(
+                                "SELECT recovery_cycle_count FROM outbox_event WHERE id = ?", Integer.class, first));
+                throw new IllegalStateException("synthetic second recovery audit failure");
+            }
+        };
+        OutboxOperations operations = repositoryAt(now.plusSeconds(1), audit, 3, 3);
+        try {
+            IllegalStateException failure = assertThrows(IllegalStateException.class, operations::recoverDueDead);
+            assertEquals("synthetic second recovery audit failure", failure.getMessage());
+            assertEquals(List.of(first, second), audited);
+
+            for (UUID eventId : List.of(first, second)) {
+                assertEquals(
+                        "DEAD",
+                        jdbc.queryForObject("SELECT status FROM outbox_event WHERE id = ?", String.class, eventId));
+                assertEquals(
+                        0,
+                        jdbc.queryForObject(
+                                "SELECT recovery_cycle_count FROM outbox_event WHERE id = ?", Integer.class, eventId));
+                assertEquals(
+                        3,
+                        jdbc.queryForObject(
+                                "SELECT attempt_count FROM outbox_event WHERE id = ?", Integer.class, eventId));
+                assertEquals(
+                        0,
+                        jdbc.queryForObject(
+                                "SELECT COUNT(*) FROM audit_event WHERE resource_id = ?", Integer.class, eventId));
+            }
+        } finally {
+            jdbc.update("DELETE FROM outbox_event WHERE id IN (?, ?)", first, second);
+        }
+    }
+
+    private static UUID insertTransactionProbeEvent(Instant now, String status) {
+        UUID id = UUID.randomUUID();
+        UUID correlation = UUID.randomUUID();
+        // Cold recovery only sees events that exhausted a claimed publication cycle.
+        int attemptCount = "DEAD".equals(status) ? 3 : 0;
+        jdbc.update(
+                """
+                INSERT INTO outbox_event (
+                    id, tenant_id, aggregate_type, aggregate_id, aggregate_version, event_type,
+                    schema_version, correlation_id, causation_id, payload, status, attempt_count,
+                    available_at, created_at, retryable
+                ) VALUES (?, '00000000-0000-0000-0000-000000000001', 'REVERSAL_COMMAND', ?, 1,
+                          'ReversalAccepted.v1', 1, ?, ?, '{}'::jsonb, ?, ?, ?, ?, TRUE)
+                """,
+                id,
+                UUID.randomUUID(),
+                correlation,
+                correlation,
+                status,
+                attemptCount,
+                Timestamp.from(now),
+                Timestamp.from(now));
+        return id;
+    }
+
+    private static void appendTransactionProbeAudit(OutboxMessage message, String action) {
+        assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
+        PostgresAuditStore audit = new PostgresAuditStore(
+                jdbc,
+                new ResilientPaySecurityProperties(
+                        "resilientpay-api",
+                        "transaction-probe-evidence-key",
+                        "transaction-probe-v1",
+                        "urn:resilientpay:aal2"),
+                new WorkflowMetrics(new SimpleMeterRegistry()));
+        audit.append(new AuditEntry(
+                new ActorContext(
+                        new TenantId(message.tenantId()),
+                        new ActorId("transaction-probe"),
+                        Set.of("ROLE_SERVICE"),
+                        null),
+                action,
+                "OUTBOX_EVENT",
+                message.id(),
+                "TRANSACTION_PROBE",
+                "SUCCEEDED",
+                null,
+                message.correlationId(),
+                null,
+                Map.of(),
+                Instant.parse("2026-08-24T14:00:00Z")));
+    }
+
+    private static OutboxProperties transactionProbeProperties() {
+        return new OutboxProperties(
+                10, Duration.ofSeconds(30), Duration.ofMillis(500), 3, Duration.ofSeconds(5), Duration.ofMinutes(5), 3);
+    }
+
+    private static OutboxOperations repositoryAt(Instant now, AtomicInteger recoveries) {
+        return repositoryAt(
+                now,
+                (message, recoveryCount) -> {
+                    assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
+                    recoveries.incrementAndGet();
+                },
+                3,
+                3);
+    }
+
+    private static OutboxOperations repositoryAt(
             Instant now, OutboxRecoveryAudit audit, int maxAttempts, int maxRecoveryCycles) {
-        return new PostgresOutboxRepository(
+        PostgresOutboxRepository repository = new PostgresOutboxRepository(
                 jdbc,
                 Clock.fixed(now, java.time.ZoneOffset.UTC),
                 new OutboxProperties(
@@ -308,5 +458,6 @@ class DemoFlywayIT {
                         Duration.ofMinutes(5),
                         maxRecoveryCycles),
                 audit);
+        return new OutboxApplicationService(transactions, repository, message -> {});
     }
 }

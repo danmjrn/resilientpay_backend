@@ -1,4 +1,6 @@
-package za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging;
+package za.co.shapeitsolutions.portfolio.resilientpay.application.port.out;
+
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
 
 /**
  * Records a broker-confirmed outbox publication before its lease becomes terminally published.

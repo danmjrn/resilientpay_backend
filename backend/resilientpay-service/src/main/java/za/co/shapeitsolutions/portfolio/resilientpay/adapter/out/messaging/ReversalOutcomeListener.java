@@ -11,7 +11,8 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.PostgresOrchestrationStore;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutcomeObservation;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.in.WorkflowBackgroundOperations;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ConditionalOnRuntimeRole;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.MessagingProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.domain.shared.TenantId;
@@ -31,8 +32,7 @@ public final class ReversalOutcomeListener {
     private final ObjectMapper objectMapper;
     private final MessageIntegrity integrity;
     private final MessagingProperties properties;
-    private final PostgresOrchestrationStore store;
-    private final PostgresMessageQuarantineRepository quarantine;
+    private final WorkflowBackgroundOperations operations;
     private final MeterRegistry meterRegistry;
     private final RabbitTraceContext traceContext;
 
@@ -42,8 +42,7 @@ public final class ReversalOutcomeListener {
      * @param objectMapper strict JSON deserializer
      * @param integrity envelope and body integrity boundary
      * @param properties wire limits and active key
-     * @param store transactional inbox and workflow adapter
-     * @param quarantine digest-only invalid-message sink
+     * @param operations application-owned outcome and quarantine transactions
      * @param meterRegistry low-cardinality outcome metrics
      * @param traceContext bounded W3C message trace propagation
      */
@@ -51,15 +50,13 @@ public final class ReversalOutcomeListener {
             ObjectMapper objectMapper,
             MessageIntegrity integrity,
             MessagingProperties properties,
-            PostgresOrchestrationStore store,
-            PostgresMessageQuarantineRepository quarantine,
+            WorkflowBackgroundOperations operations,
             MeterRegistry meterRegistry,
             RabbitTraceContext traceContext) {
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
         this.integrity = Objects.requireNonNull(integrity, "integrity must not be null");
         this.properties = Objects.requireNonNull(properties, "properties must not be null");
-        this.store = Objects.requireNonNull(store, "store must not be null");
-        this.quarantine = Objects.requireNonNull(quarantine, "quarantine must not be null");
+        this.operations = Objects.requireNonNull(operations, "operations must not be null");
         this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry must not be null");
         this.traceContext = Objects.requireNonNull(traceContext, "traceContext must not be null");
     }
@@ -81,7 +78,7 @@ public final class ReversalOutcomeListener {
                 Envelope envelope = validateEnvelope(message, body);
                 ReversalOutcomePayload payload = readPayload(body);
                 traceContext.recordValidatedCorrelation(envelope.correlationId());
-                store.processOutcome(new OutcomeObservation(
+                operations.processOutcome(new OutcomeObservation(
                         new TenantId(envelope.tenantId()),
                         envelope.messageId(),
                         envelope.correlationId(),
@@ -98,7 +95,7 @@ public final class ReversalOutcomeListener {
             }
         } catch (InvalidOutcomeMessageException exception) {
             Map<String, Object> headers = message.getMessageProperties().getHeaders();
-            quarantine.record(
+            operations.quarantine(
                     optionalUuid(headers.get("tenantId")),
                     optionalMessageId(headers.get("messageId")),
                     optionalUuid(headers.get("correlationId")),

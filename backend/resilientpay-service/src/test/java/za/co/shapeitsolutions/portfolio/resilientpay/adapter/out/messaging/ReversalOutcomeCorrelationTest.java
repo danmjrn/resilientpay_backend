@@ -7,7 +7,6 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -22,7 +21,7 @@ import org.mockito.InOrder;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageProperties;
 import tools.jackson.databind.json.JsonMapper;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.PostgresOrchestrationStore;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.in.WorkflowBackgroundOperations;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.MessagingProperties;
 
 /**
@@ -43,7 +42,7 @@ class ReversalOutcomeCorrelationTest {
             """;
 
     private RabbitTraceContext traceContext;
-    private PostgresOrchestrationStore store;
+    private WorkflowBackgroundOperations store;
     private MessageIntegrity integrity;
     private ReversalOutcomeListener listener;
 
@@ -51,7 +50,7 @@ class ReversalOutcomeCorrelationTest {
     void configureListener() {
         traceContext = mock(RabbitTraceContext.class);
         when(traceContext.isValid(any(MessageProperties.class))).thenReturn(true);
-        store = mock(PostgresOrchestrationStore.class);
+        store = mock(WorkflowBackgroundOperations.class);
         MessagingProperties properties = messaging();
         integrity = new MessageIntegrity(properties);
         listener = new ReversalOutcomeListener(
@@ -59,7 +58,6 @@ class ReversalOutcomeCorrelationTest {
                 integrity,
                 properties,
                 store,
-                mock(PostgresMessageQuarantineRepository.class),
                 new SimpleMeterRegistry(),
                 traceContext);
     }
@@ -99,7 +97,8 @@ class ReversalOutcomeCorrelationTest {
         listener.consume(message);
 
         verify(traceContext, never()).recordValidatedCorrelation(nullable(UUID.class));
-        verifyNoInteractions(store);
+        verify(store, never()).processOutcome(any());
+        verify(store).quarantine(any(), nullable(String.class), nullable(UUID.class), any(), any());
     }
 
     private Message signedMessage(String json) {

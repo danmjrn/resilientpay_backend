@@ -40,8 +40,6 @@ import org.springframework.amqp.rabbit.listener.SimpleMessageListenerContainer;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.jdbc.support.JdbcTransactionManager;
-import org.springframework.transaction.TransactionDefinition;
-import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -49,12 +47,20 @@ import org.testcontainers.rabbitmq.RabbitMQContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.json.JsonMapper;
+import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.PostgresAuditStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.PostgresOrchestrationStore;
+import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.SpringTransactionBoundary;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.WorkflowMetrics;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.AcceptReversalCommand;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.AcceptanceResult;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ActorContext;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.DemonstrationFailure;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxTraceContext;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.in.ReversalOperations;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.AuditApplicationService;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.OutboxApplicationService;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.ReversalApplicationService;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.WorkflowBackgroundService;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.MessagingProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ReconciliationProperties;
@@ -88,11 +94,11 @@ class RuntimeReversalMessagePipelineIT {
     private CachingConnectionFactory connectionFactory;
     private SimpleMessageListenerContainer listenerContainer;
     private JdbcTemplate jdbc;
-    private TransactionTemplate transaction;
     private ObjectMapper objectMapper;
     private MessagingProperties messaging;
     private RabbitTemplate rabbitTemplate;
     private PostgresOrchestrationStore store;
+    private ReversalOperations operations;
     private RabbitOutboxPublisher publisher;
     private MessageIntegrity integrity;
 
@@ -113,9 +119,7 @@ class RuntimeReversalMessagePipelineIT {
                 .migrate();
         jdbc = new JdbcTemplate(dataSource);
         JdbcTransactionManager transactionManager = new JdbcTransactionManager(dataSource);
-        transaction = new TransactionTemplate(transactionManager);
-        TransactionTemplate independentAudit = new TransactionTemplate(transactionManager);
-        independentAudit.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        SpringTransactionBoundary transactions = new SpringTransactionBoundary(transactionManager);
         objectMapper = JsonMapper.builder().findAndAddModules().build();
         messaging = messagingProperties();
         integrity = new MessageIntegrity(messaging);
@@ -134,20 +138,28 @@ class RuntimeReversalMessagePipelineIT {
         Clock clock = Clock.systemUTC();
         SimpleMeterRegistry meters = new SimpleMeterRegistry();
         QuarantineMetrics quarantineMetrics = new QuarantineMetrics(meters);
-        store = new PostgresOrchestrationStore(
+        WorkflowMetrics workflowMetrics = new WorkflowMetrics(meters);
+        PostgresAuditStore auditStore = new PostgresAuditStore(
                 jdbc,
-                clock,
-                new ReconciliationProperties(Duration.ofMillis(100), 20, Duration.ofMinutes(10)),
                 new ResilientPaySecurityProperties(
                         "resilientpay-api",
                         "pipeline-evidence-integrity-key",
                         "pipeline-evidence-key-v1",
                         "urn:resilientpay:aal2"),
-                new WorkflowMetrics(meters),
+                workflowMetrics);
+        AuditApplicationService independentAudit = new AuditApplicationService(auditStore, transactions, clock);
+        store = new PostgresOrchestrationStore(
+                jdbc,
+                clock,
+                new ReconciliationProperties(Duration.ofMillis(100), 20, Duration.ofMinutes(10)),
+                auditStore,
+                workflowMetrics,
                 quarantineMetrics,
                 traceContext,
                 independentAudit,
                 new RuntimeMode(true));
+        operations = new ReversalApplicationService(
+                store, (tenant, action) -> {}, independentAudit, transactions, "urn:resilientpay:aal2");
         PostgresOutboxRepository repository = new PostgresOutboxRepository(
                 jdbc,
                 clock,
@@ -161,10 +173,9 @@ class RuntimeReversalMessagePipelineIT {
                         3),
                 store);
         publisher = new RabbitOutboxPublisher(
-                repository,
+                new OutboxApplicationService(transactions, repository, store),
                 rabbitTemplate,
                 integrity,
-                store,
                 messaging,
                 new OutboxProperties(
                         20,
@@ -180,19 +191,21 @@ class RuntimeReversalMessagePipelineIT {
                 objectMapper,
                 integrity,
                 messaging,
-                store,
-                new PostgresMessageQuarantineRepository(jdbc, clock, messaging, quarantineMetrics),
+                new WorkflowBackgroundService(
+                        transactions,
+                        store,
+                        store,
+                        new PostgresLifecycleProjectionStore(jdbc),
+                        new PostgresMessageQuarantineRepository(jdbc, clock, messaging, quarantineMetrics)),
                 meters,
                 traceContext);
         listenerContainer = new SimpleMessageListenerContainer(connectionFactory);
         listenerContainer.setQueueNames(messaging.outcomeQueue());
         listenerContainer.setAcknowledgeMode(AcknowledgeMode.AUTO);
         listenerContainer.setDefaultRequeueRejected(false);
-        // This fixture constructs the store directly, so its production @Transactional
-        // proxy is absent. Preserve the same commit-before-ack outcome/inbox boundary.
-        TransactionTemplate outcomeTransaction = new TransactionTemplate(transactionManager);
-        listenerContainer.setMessageListener(
-                message -> outcomeTransaction.executeWithoutResult(status -> listener.consume(message)));
+        // The real application service commits the outcome/inbox or quarantine before return;
+        // the listener must not invent a second, adapter-owned transaction around that use case.
+        listenerContainer.setMessageListener(listener::consume);
         listenerContainer.start();
     }
 
@@ -220,9 +233,8 @@ class RuntimeReversalMessagePipelineIT {
 
     private void verifyConfirmedOutcome(Duration outcomeDelay) throws Exception {
         UUID correlationId = UUID.randomUUID();
-        AcceptanceResult accepted = transaction.execute(status -> store.accept(
-                new ActorContext(
-                        new TenantId(TENANT_ID), new ActorId("pipeline-operator"), Set.of("SCOPE_reversal.execute")),
+        AcceptanceResult accepted = operations.accept(
+                operator(),
                 new AcceptReversalCommand(
                         "synth-txn-card-0001",
                         OperationType.CARD_PURCHASE,
@@ -230,7 +242,7 @@ class RuntimeReversalMessagePipelineIT {
                         new ReversalReason("Synthetic pipeline verification"),
                         DemonstrationFailure.NONE,
                         "pipeline-idempotency-0001",
-                        new CorrelationId(correlationId))));
+                        new CorrelationId(correlationId)));
         assertNotNull(accepted);
 
         publisher.publishDue();
@@ -257,7 +269,7 @@ class RuntimeReversalMessagePipelineIT {
             await().during(outcomeDelay).atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
                 assertEquals(
                         ReversalCommandState.EXECUTING,
-                        store.getReversal(new TenantId(TENANT_ID), commandId).status());
+                        operations.getReversal(operator(), commandId).status());
                 assertEquals(
                         "DISPATCHED",
                         jdbc.queryForObject(
@@ -298,7 +310,7 @@ class RuntimeReversalMessagePipelineIT {
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             assertEquals(
                     ReversalCommandState.COMPLETED,
-                    store.getReversal(new TenantId(TENANT_ID), commandId).status());
+                    operations.getReversal(operator(), commandId).status());
             assertEquals(
                     1,
                     jdbc.queryForObject(
@@ -332,6 +344,13 @@ class RuntimeReversalMessagePipelineIT {
                             TENANT_ID,
                             commandId));
         });
+    }
+
+    private static ActorContext operator() {
+        return new ActorContext(
+                new TenantId(TENANT_ID),
+                new ActorId("pipeline-operator"),
+                Set.of("SCOPE_reversals.write", "SCOPE_reversals.read"));
     }
 
     @Test

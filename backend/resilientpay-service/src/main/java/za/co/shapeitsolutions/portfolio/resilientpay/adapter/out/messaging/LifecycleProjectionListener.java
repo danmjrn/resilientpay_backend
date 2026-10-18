@@ -14,6 +14,8 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.in.WorkflowBackgroundOperations;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.LifecycleProjectionStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ConditionalOnRuntimeRole;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.MessagingProperties;
 
@@ -35,8 +37,7 @@ public final class LifecycleProjectionListener {
     private final ObjectMapper objectMapper;
     private final MessageIntegrity integrity;
     private final MessagingProperties properties;
-    private final LifecycleProjectionStore projection;
-    private final PostgresMessageQuarantineRepository quarantine;
+    private final WorkflowBackgroundOperations operations;
     private final MeterRegistry meterRegistry;
     private final RabbitTraceContext traceContext;
     private final Clock clock;
@@ -46,16 +47,14 @@ public final class LifecycleProjectionListener {
             ObjectMapper objectMapper,
             MessageIntegrity integrity,
             MessagingProperties properties,
-            LifecycleProjectionStore projection,
-            PostgresMessageQuarantineRepository quarantine,
+            WorkflowBackgroundOperations operations,
             MeterRegistry meterRegistry,
             RabbitTraceContext traceContext,
             Clock clock) {
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
         this.integrity = Objects.requireNonNull(integrity, "integrity must not be null");
         this.properties = Objects.requireNonNull(properties, "properties must not be null");
-        this.projection = Objects.requireNonNull(projection, "projection must not be null");
-        this.quarantine = Objects.requireNonNull(quarantine, "quarantine must not be null");
+        this.operations = Objects.requireNonNull(operations, "operations must not be null");
         this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry must not be null");
         this.traceContext = Objects.requireNonNull(traceContext, "traceContext must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
@@ -74,7 +73,7 @@ public final class LifecycleProjectionListener {
             validatePayload(envelope.eventType(), body);
             try (RabbitTraceContext.TraceScope ignored =
                     traceContext.startConsumer(message.getMessageProperties(), envelope.eventType())) {
-                int result = projection.record(
+                int result = operations.recordLifecycle(
                         envelope.tenantId(),
                         envelope.messageId(),
                         integrity.digest(body),
@@ -95,7 +94,7 @@ public final class LifecycleProjectionListener {
             }
         } catch (InvalidOutcomeMessageException exception) {
             Map<String, Object> headers = message.getMessageProperties().getHeaders();
-            quarantine.record(
+            operations.quarantine(
                     optionalUuid(headers.get("tenantId")),
                     optionalUuidText(headers.get("messageId")),
                     optionalUuid(headers.get("correlationId")),

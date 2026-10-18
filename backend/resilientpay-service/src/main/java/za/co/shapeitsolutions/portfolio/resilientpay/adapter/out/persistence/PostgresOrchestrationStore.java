@@ -4,7 +4,6 @@ import io.micrometer.observation.annotation.Observed;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.sql.PreparedStatement;
@@ -23,8 +22,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import org.springframework.context.annotation.Profile;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.ConnectionCallback;
@@ -33,13 +30,7 @@ import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionOperations;
 import tools.jackson.core.JacksonException;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutboxMessage;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutboxPublicationAudit;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutboxRecoveryAudit;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutboxTraceContext;
-import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.OutcomeObservation;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.QuarantineMetrics;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.RabbitTraceContext;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.AcceptReversalCommand;
@@ -48,19 +39,27 @@ import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ActorCont
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ApplicationErrorCode;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ApplicationException;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ApproveReconciliationCommand;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.AuditEntry;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.AuditEvidenceView;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.DemonstrationFailure;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.IngestOriginalCommand;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OperationPolicyView;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OriginalTransactionView;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxTraceContext;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutcomeObservation;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ProposeReconciliationCommand;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ReconciliationCaseView;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.RetryReversalCommand;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.ReversalView;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.AuditStore;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.DeadlineReconciliationStore;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.IndependentAuditPort;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OrchestrationStore;
-import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.SecurityAuditPort;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OutboxPublicationAudit;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OutboxRecoveryAudit;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OutcomeStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ReconciliationProperties;
-import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ResilientPaySecurityProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.RuntimeMode;
 import za.co.shapeitsolutions.portfolio.resilientpay.domain.policy.OperationPolicy;
 import za.co.shapeitsolutions.portfolio.resilientpay.domain.policy.OperationPolicyState;
@@ -98,10 +97,9 @@ import za.co.shapeitsolutions.portfolio.resilientpay.domain.transaction.Original
 public class PostgresOrchestrationStore
         implements OrchestrationStore,
                 DeadlineReconciliationStore,
-                SecurityAuditPort,
+                OutcomeStore,
                 OutboxPublicationAudit,
                 OutboxRecoveryAudit {
-    private static final String HMAC_ALGORITHM = "HmacSHA256";
     private static final Duration IDEMPOTENCY_RETENTION = Duration.ofDays(30);
     private static final String ACCEPT_ACTION = "ACCEPT_REVERSAL";
     private static final String INGEST_ACTION = "INGEST_ORIGINAL";
@@ -112,11 +110,11 @@ public class PostgresOrchestrationStore
     private final JdbcOperations jdbc;
     private final Clock clock;
     private final ReconciliationProperties reconciliationProperties;
-    private final ResilientPaySecurityProperties securityProperties;
+    private final AuditStore auditStore;
     private final WorkflowMetrics metrics;
     private final QuarantineMetrics quarantineMetrics;
     private final RabbitTraceContext traceContext;
-    private final TransactionOperations independentAuditTransaction;
+    private final IndependentAuditPort independentAudit;
     private final RuntimeMode runtimeMode;
 
     /**
@@ -125,37 +123,37 @@ public class PostgresOrchestrationStore
      * @param jdbc transactional JDBC access
      * @param clock UTC time boundary
      * @param reconciliationProperties bounded evidence window
-     * @param securityProperties audit integrity key
+     * @param auditStore raw audit writer joining the application transaction
      * @param metrics fixed low-cardinality lifecycle metrics
      * @param quarantineMetrics bounded invalid-message metrics
      * @param traceContext durable W3C outbox context capture
-     * @param independentAuditTransaction requires-new durable audit boundary
+     * @param independentAudit application-owned independently durable control evidence
      * @param runtimeMode immutable profile-derived capability boundary
      */
     public PostgresOrchestrationStore(
             JdbcOperations jdbc,
             Clock clock,
             ReconciliationProperties reconciliationProperties,
-            ResilientPaySecurityProperties securityProperties,
+            AuditStore auditStore,
             WorkflowMetrics metrics,
             QuarantineMetrics quarantineMetrics,
             RabbitTraceContext traceContext,
-            TransactionOperations independentAuditTransaction,
+            IndependentAuditPort independentAudit,
             RuntimeMode runtimeMode) {
         this.jdbc = jdbc;
         this.clock = clock;
         this.reconciliationProperties = reconciliationProperties;
-        this.securityProperties = securityProperties;
+        this.auditStore = auditStore;
         this.metrics = metrics;
         this.quarantineMetrics = quarantineMetrics;
         this.traceContext = traceContext;
-        this.independentAuditTransaction = independentAuditTransaction;
+        this.independentAudit = independentAudit;
         this.runtimeMode = runtimeMode;
     }
 
     @Override
     @Observed(name = "OUTBOX_PERSIST", contextualName = "OUTBOX_PERSIST")
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public AcceptanceResult accept(ActorContext actor, AcceptReversalCommand request) {
         requireMutationKey(request.idempotencyKey());
         if (request.reason().value().length() > 120) {
@@ -292,7 +290,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
     public List<ReversalView> listReversals(TenantId tenantId, ReversalCommandState status, int limit) {
         if (limit < 1 || limit > 100) {
             throw failure(ApplicationErrorCode.INVALID_REQUEST, "limit must be between 1 and 100");
@@ -311,7 +309,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
     public ReversalView getReversal(TenantId tenantId, UUID commandId) {
         ReversalView result =
                 queryOne(reversalViewSql() + " AND rc.id = ?", REVERSAL_VIEW_MAPPER, tenantId.value(), commandId);
@@ -324,7 +322,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public ReversalView retry(ActorContext actor, RetryReversalCommand request) {
         requireMutationKey(request.idempotencyKey());
         if (!"CONFIRMED_NOT_EXECUTED".equals(request.proof())
@@ -423,7 +421,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
     public List<AuditEvidenceView> evidence(TenantId tenantId, UUID commandId) {
         requireCommandExists(tenantId, commandId);
         return jdbc.query(
@@ -448,7 +446,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public OriginalTransactionView ingestOriginal(ActorContext actor, IngestOriginalCommand request) {
         requireMutationKey(request.idempotencyKey());
         if (!request.transactionToken().matches("^synth-[a-z0-9-]{8,64}$")) {
@@ -539,7 +537,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
     public List<OriginalTransactionView> listOriginals(TenantId tenantId) {
         return jdbc.query("""
                 SELECT id, COALESCE(public_reference_token, external_reference_token)
@@ -553,7 +551,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
     public List<OperationPolicyView> listPolicies(TenantId tenantId) {
         return jdbc.query(
                 """
@@ -573,7 +571,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional(readOnly = true)
+    @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
     public List<ReconciliationCaseView> listReconciliationCases(TenantId tenantId) {
         return jdbc.query(
                 reconciliationViewSql() + " WHERE rc.tenant_id = ? ORDER BY rc.opened_at DESC",
@@ -582,7 +580,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public ReconciliationCaseView propose(ActorContext actor, ProposeReconciliationCommand request) {
         requireMutationKey(request.idempotencyKey());
         if (request.purpose().length() < 8
@@ -667,7 +665,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public ReconciliationCaseView approve(ActorContext actor, ApproveReconciliationCommand request) {
         requireMutationKey(request.idempotencyKey());
         if (request.purpose().length() < 8 || request.purpose().length() > 160) {
@@ -743,7 +741,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public int reconcileOverdueAttempts(int limit) {
         if (limit < 1 || limit > 200) {
             throw new IllegalArgumentException("deadline scan limit must be between 1 and 200");
@@ -801,44 +799,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void recordAuthorizationDenied(
-            ActorContext actor, String action, UUID resourceId, UUID correlationId, String reasonCode) {
-        writeAudit(
-                actor,
-                action,
-                "REVERSAL_COMMAND",
-                resourceId,
-                "AUTHORIZATION",
-                "DENIED",
-                reasonCode,
-                correlationId,
-                null,
-                Map.of("decision", "DENIED"),
-                clock.instant());
-        metrics.authorizationDenied();
-    }
-
-    @Override
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void recordEvidenceViewed(ActorContext actor, UUID commandId, UUID correlationId) {
-        writeAudit(
-                actor,
-                "EVIDENCE_VIEWED",
-                "REVERSAL_COMMAND",
-                commandId,
-                "AUDIT_REVIEW",
-                "SUCCEEDED",
-                null,
-                correlationId,
-                null,
-                Map.of("view", "REDACTED_AUDIT_TIMELINE"),
-                clock.instant());
-        metrics.evidenceViewed();
-    }
-
-    @Override
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.MANDATORY)
     public void recordPublished(OutboxMessage message) {
         ActorContext publisher = new ActorContext(
                 new TenantId(message.tenantId()), new ActorId("outbox-publisher"), Set.of("ROLE_SERVICE"));
@@ -859,7 +820,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public void recordRecovered(OutboxMessage message, int recoveryCount) {
         ActorContext publisher = new ActorContext(
                 new TenantId(message.tenantId()), new ActorId("outbox-recovery"), Set.of("ROLE_SERVICE"));
@@ -880,7 +841,7 @@ public class PostgresOrchestrationStore
     }
 
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public void recordTerminalFailure(OutboxMessage message, int recoveryCount, String errorCode) {
         ActorContext publisher = new ActorContext(
                 new TenantId(message.tenantId()), new ActorId("outbox-recovery"), Set.of("ROLE_SERVICE"));
@@ -906,7 +867,7 @@ public class PostgresOrchestrationStore
      *
      * @param observation validated downstream observation
      */
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public void processOutcome(OutcomeObservation observation) {
         int inserted = update(
                 """
@@ -1661,38 +1622,8 @@ public class PostgresOrchestrationStore
             Integer policyVersion,
             Map<String, Object> safeDetails,
             Instant at) {
-        UUID eventId = UUID.randomUUID();
-        String actorPseudonym = sha256(actor.actorId().value()).substring(0, 24);
-        String authorities = json(actor.authorities().stream().sorted().toList());
-        String details = json(safeDetails);
-        String canonical = String.join(
-                "|",
-                eventId.toString(),
-                actor.tenantId().value().toString(),
-                resourceType,
-                resourceId.toString(),
-                action,
-                outcome,
-                actorPseudonym,
-                purpose,
-                correlationId.toString(),
-                at.toString(),
-                details);
-        String digest = hmac(canonical, securityProperties.evidenceHmacKey());
-        update(
-                """
-                INSERT INTO audit_event (
-                    id, tenant_id, occurred_at, actor_subject_token, actor_type, authorities,
-                    action, resource_type, resource_id, purpose_code, outcome, reason_code,
-                    correlation_id, policy_version, safe_details, key_id, evidence_digest
-                ) VALUES (?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)
-                """,
-                eventId,
-                actor.tenantId().value(),
-                at,
-                actorPseudonym,
-                actor.authorities().contains("ROLE_SERVICE") ? "SERVICE" : "HUMAN",
-                authorities,
+        auditStore.append(new AuditEntry(
+                actor,
                 action,
                 resourceType,
                 resourceId,
@@ -1701,9 +1632,8 @@ public class PostgresOrchestrationStore
                 reason,
                 correlationId,
                 policyVersion,
-                details,
-                securityProperties.evidenceKeyId(),
-                digest);
+                safeDetails,
+                at));
     }
 
     private <T> T queryOne(String sql, RowMapper<T> mapper, Object... arguments) {
@@ -1763,7 +1693,7 @@ public class PostgresOrchestrationStore
             UUID correlationId,
             String reasonCode,
             Map<String, Object> details) {
-        independentAuditTransaction.executeWithoutResult(ignored -> writeAudit(
+        independentAudit.recordIndependent(new AuditEntry(
                 actor,
                 action,
                 resourceType,
@@ -1878,16 +1808,6 @@ public class PostgresOrchestrationStore
         String normalized =
                 Objects.requireNonNull(tokenOrDigest, "token must not be null").strip();
         return normalized.matches("[a-f0-9]{64}") ? normalized : sha256(normalized);
-    }
-
-    private static String hmac(String value, String key) {
-        try {
-            Mac mac = Mac.getInstance(HMAC_ALGORITHM);
-            mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), HMAC_ALGORITHM));
-            return HexFormat.of().formatHex(mac.doFinal(value.getBytes(StandardCharsets.UTF_8)));
-        } catch (GeneralSecurityException exception) {
-            throw new IllegalStateException("HMAC-SHA256 is required by the Java platform", exception);
-        }
     }
 
     private static Instant instant(ResultSet resultSet, String column) throws SQLException {

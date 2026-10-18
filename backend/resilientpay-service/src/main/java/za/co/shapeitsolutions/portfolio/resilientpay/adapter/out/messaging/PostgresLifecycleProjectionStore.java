@@ -6,7 +6,9 @@ import java.util.UUID;
 import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.LifecycleProjectionStore;
 
 /**
  * Persists a payload-free, tenant-scoped inbox marker for lifecycle projection delivery.
@@ -26,7 +28,7 @@ public class PostgresLifecycleProjectionStore implements LifecycleProjectionStor
     }
 
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public int record(
             UUID tenantId,
             UUID messageId,

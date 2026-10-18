@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.amqp.core.MessageProperties;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxTraceContext;
 
 /**
  * Propagates only bounded W3C trace context across RabbitMQ. Baggage, payloads, tenant identifiers,

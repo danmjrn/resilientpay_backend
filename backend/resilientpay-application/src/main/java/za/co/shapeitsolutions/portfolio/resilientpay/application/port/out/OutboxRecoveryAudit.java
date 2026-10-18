@@ -1,4 +1,6 @@
-package za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging;
+package za.co.shapeitsolutions.portfolio.resilientpay.application.port.out;
+
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
 
 /**
  * Records one bounded transition from cold outbox recovery back to the hot publication queue.

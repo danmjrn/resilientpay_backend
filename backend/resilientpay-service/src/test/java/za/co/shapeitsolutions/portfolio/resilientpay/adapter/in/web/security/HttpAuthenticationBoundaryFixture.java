@@ -10,6 +10,7 @@ import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.Supplier;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
@@ -33,6 +34,7 @@ import za.co.shapeitsolutions.portfolio.resilientpay.application.port.in.Reversa
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.MutationAdmissionPort;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OrchestrationStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.SecurityAuditPort;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.TransactionBoundary;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.service.ReversalApplicationService;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ResilientPayHttpProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.domain.reconciliation.ReconciliationCaseState;
@@ -100,7 +102,27 @@ class HttpAuthenticationBoundaryFixture {
     @Bean
     ReversalOperations authenticationBoundaryOperations(
             OrchestrationStore store, MutationAdmissionPort admission, SecurityAuditPort audit) {
-        return new ReversalApplicationService(store, admission, audit, ASSURANCE);
+        return new ReversalApplicationService(
+                store,
+                admission,
+                audit,
+                new TransactionBoundary() {
+                    @Override
+                    public <T> T required(Supplier<T> work) {
+                        return work.get();
+                    }
+
+                    @Override
+                    public <T> T readOnly(Supplier<T> work) {
+                        return work.get();
+                    }
+
+                    @Override
+                    public <T> T requiresNew(Supplier<T> work) {
+                        return work.get();
+                    }
+                },
+                ASSURANCE);
     }
 
     /** Records downstream calls and supplies safe representations solely for positive HTTP controls. */

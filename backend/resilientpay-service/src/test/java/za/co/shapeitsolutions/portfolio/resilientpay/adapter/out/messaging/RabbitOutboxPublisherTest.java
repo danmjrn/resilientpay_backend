@@ -2,12 +2,17 @@ package za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.micrometer.tracing.Tracer;
 import io.micrometer.tracing.propagation.Propagator;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -16,6 +21,15 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.AbstractPlatformTransactionManager;
+import org.springframework.transaction.support.DefaultTransactionStatus;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.SpringTransactionBoundary;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxTraceContext;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OutboxPublicationAudit;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.OutboxApplicationService;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.MessagingProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProperties;
 
@@ -33,12 +47,12 @@ class RabbitOutboxPublisherTest {
         RecordingRepository repository = new RecordingRepository(message);
         RecordingRabbitTemplate rabbit = new RecordingRabbitTemplate();
         RecordingAudit audit = new RecordingAudit();
+        RecordingTransactionManager manager = new RecordingTransactionManager();
         MessagingProperties messaging = messaging();
         RabbitOutboxPublisher publisher = new RabbitOutboxPublisher(
-                repository,
+                new OutboxApplicationService(new SpringTransactionBoundary(manager), repository, audit),
                 rabbit,
                 new MessageIntegrity(messaging),
-                audit,
                 messaging,
                 outbox(),
                 new SimpleMeterRegistry(),
@@ -50,6 +64,9 @@ class RabbitOutboxPublisherTest {
         assertEquals(message, repository.published);
         assertEquals(message, audit.published);
         assertEquals(1, rabbit.sendCalls);
+        assertEquals(List.of(0, 0, 3, 0), manager.propagations);
+        assertEquals(4, manager.commits);
+        assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
     }
 
     @Test
@@ -69,12 +86,12 @@ class RabbitOutboxPublisherTest {
         RecordingRepository repository = new RecordingRepository(claimed, prepared);
         RecordingRabbitTemplate rabbit = new RecordingRabbitTemplate();
         RecordingAudit audit = new RecordingAudit();
+        RecordingTransactionManager manager = new RecordingTransactionManager();
         MessagingProperties messaging = messaging();
         RabbitOutboxPublisher publisher = new RabbitOutboxPublisher(
-                repository,
+                new OutboxApplicationService(new SpringTransactionBoundary(manager), repository, audit),
                 rabbit,
                 new MessageIntegrity(messaging),
-                audit,
                 messaging,
                 outbox(),
                 new SimpleMeterRegistry(),
@@ -86,6 +103,38 @@ class RabbitOutboxPublisherTest {
         assertEquals(prepared, repository.published);
         assertEquals(prepared, audit.published);
         assertArrayEquals(prepared.payload(), rabbit.sent.getBody());
+        assertEquals(List.of(0, 0, 0, 3, 0), manager.propagations);
+        assertEquals(5, manager.commits);
+        assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+    }
+
+    @Test
+    void failedIndependentConfirmationAuditPreventsPublishedStateUpdate() {
+        RecordingRepository repository = new RecordingRepository(message("ReversalAccepted.v1", "{}"));
+        RecordingTransactionManager manager = new RecordingTransactionManager();
+        RecordingRabbitTemplate rabbit = new RecordingRabbitTemplate();
+        MessagingProperties properties = messaging();
+        OutboxPublicationAudit failedAudit = message -> {
+            assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
+            throw new IllegalStateException("synthetic audit failure");
+        };
+        RabbitOutboxPublisher publisher = new RabbitOutboxPublisher(
+                new OutboxApplicationService(new SpringTransactionBoundary(manager), repository, failedAudit),
+                rabbit,
+                new MessageIntegrity(properties),
+                properties,
+                outbox(),
+                new SimpleMeterRegistry(),
+                new RabbitTraceContext(Tracer.NOOP, Propagator.NOOP));
+
+        assertThrows(IllegalStateException.class, publisher::publishDue);
+
+        assertEquals(1, rabbit.sendCalls);
+        assertNull(repository.published);
+        assertEquals(List.of(0, 0, 3), manager.propagations);
+        assertEquals(2, manager.commits);
+        assertEquals(1, manager.rollbacks);
+        assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
     }
 
     private static OutboxMessage message(String eventType, String payload) {
@@ -156,22 +205,26 @@ class RabbitOutboxPublisherTest {
 
         @Override
         public int recoverDueDead() {
+            assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
             return 0;
         }
 
         @Override
         public List<OutboxMessage> claimDue() {
+            assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
             return List.of(claimed);
         }
 
         @Override
         public OutboxMessage prepareForPublish(OutboxMessage message) {
+            assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
             preparationCalls++;
             return prepared;
         }
 
         @Override
         public void markPublished(OutboxMessage message) {
+            assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
             published = message;
         }
 
@@ -192,6 +245,9 @@ class RabbitOutboxPublisherTest {
 
         @Override
         public void send(String exchange, String routingKey, Message message, CorrelationData correlationData) {
+            assertFalse(
+                    TransactionSynchronizationManager.isActualTransactionActive(),
+                    "Rabbit send/confirmation must execute outside every database transaction");
             sendCalls++;
             sent = message;
             correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
@@ -208,7 +264,40 @@ class RabbitOutboxPublisherTest {
 
         @Override
         public void recordPublished(OutboxMessage message) {
+            assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
             published = message;
+        }
+    }
+
+    /**
+     * Runs Spring's real transaction-scope machinery without a database and records its completion.
+     *
+     * @author Daniel Jr Nkulu
+     */
+    private static final class RecordingTransactionManager extends AbstractPlatformTransactionManager {
+        private static final long serialVersionUID = 1L;
+        private final List<Integer> propagations = new ArrayList<>();
+        private int commits;
+        private int rollbacks;
+
+        @Override
+        protected Object doGetTransaction() {
+            return new Object();
+        }
+
+        @Override
+        protected void doBegin(Object transaction, TransactionDefinition definition) {
+            propagations.add(definition.getPropagationBehavior());
+        }
+
+        @Override
+        protected void doCommit(DefaultTransactionStatus status) {
+            commits++;
+        }
+
+        @Override
+        protected void doRollback(DefaultTransactionStatus status) {
+            rollbacks++;
         }
     }
 }

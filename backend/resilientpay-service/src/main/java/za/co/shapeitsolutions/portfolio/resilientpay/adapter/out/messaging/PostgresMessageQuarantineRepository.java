@@ -11,7 +11,9 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.MessageQuarantineStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.MessagingProperties;
 
 /**
@@ -21,7 +23,7 @@ import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.MessagingP
  */
 @Repository
 @Profile("!test")
-public class PostgresMessageQuarantineRepository {
+public class PostgresMessageQuarantineRepository implements MessageQuarantineStore {
     private final JdbcOperations jdbc;
     private final Clock clock;
     private final MessagingProperties properties;
@@ -52,7 +54,8 @@ public class PostgresMessageQuarantineRepository {
      * @param payloadDigest SHA-256 of the exact rejected body
      * @param errorCode stable validation reason
      */
-    @Transactional
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
     public void record(UUID tenantId, String messageId, UUID correlationId, String payloadDigest, String errorCode) {
         String identity = properties.consumerName()
                 + "|"

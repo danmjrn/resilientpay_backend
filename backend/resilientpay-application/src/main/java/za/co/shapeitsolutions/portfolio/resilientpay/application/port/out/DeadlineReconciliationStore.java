@@ -1,4 +1,4 @@
-package za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence;
+package za.co.shapeitsolutions.portfolio.resilientpay.application.port.out;
 
 /**
  * Exposes the bounded PostgreSQL deadline scan to the scheduled reconciler.

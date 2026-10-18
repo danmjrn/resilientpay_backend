@@ -1,4 +1,4 @@
-package za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging;
+package za.co.shapeitsolutions.portfolio.resilientpay.application.port.out;
 
 import java.time.Instant;
 import java.util.UUID;

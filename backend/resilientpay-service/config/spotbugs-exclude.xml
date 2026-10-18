@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter>
+  <!-- SA-002: the private final auditStore field deliberately shares the raw persistence
+       collaborator so audit appends join the caller's transaction; it is not value state.
+       Exact reviewed scope and re-review triggers: docs/testing/skip-register.md. -->
+  <Match>
+    <Bug pattern="EI_EXPOSE_REP2"/>
+    <Class name="za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.PostgresOrchestrationStore"/>
+    <Method name="&lt;init&gt;" params="org.springframework.jdbc.core.JdbcOperations,java.time.Clock,za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ReconciliationProperties,za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.AuditStore,za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence.WorkflowMetrics,za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.QuarantineMetrics,za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.RabbitTraceContext,za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.IndependentAuditPort,za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.RuntimeMode" returns="void"/>
+    <Field name="auditStore" type="za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.AuditStore"/>
+  </Match>
+</FindBugsFilter>

@@ -1,4 +1,4 @@
-package za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging;
+package za.co.shapeitsolutions.portfolio.resilientpay.application.model;
 
 /**
  * Carries nullable bounded W3C context across the durable outbox scheduling boundary.

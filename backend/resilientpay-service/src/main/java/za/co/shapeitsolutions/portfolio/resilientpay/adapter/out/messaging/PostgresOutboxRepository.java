@@ -11,7 +11,12 @@ import java.util.UUID;
 import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxMessage;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.model.OutboxTraceContext;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OutboxRecoveryAudit;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.OutboxStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProperties;
 
 /**
@@ -22,7 +27,7 @@ import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProp
  */
 @Repository
 @Profile("!test")
-public class PostgresOutboxRepository {
+public class PostgresOutboxRepository implements OutboxStore {
     private final JdbcOperations jdbc;
     private final Clock clock;
     private final OutboxProperties properties;
@@ -50,7 +55,8 @@ public class PostgresOutboxRepository {
      *
      * @return leased messages owned by this process
      */
-    @Transactional
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
     public List<OutboxMessage> claimDue() {
         Instant now = clock.instant();
         return jdbc.query(
@@ -103,7 +109,8 @@ public class PostgresOutboxRepository {
      * @param message leased message
      * @return message with a dispatch-time deadline when it is an execution request
      */
-    @Transactional
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
     public OutboxMessage prepareForPublish(OutboxMessage message) {
         if (!"ReversalExecutionRequested.v1".equals(message.eventType())) {
             return message;
@@ -145,7 +152,8 @@ public class PostgresOutboxRepository {
      *
      * @param message confirmed message
      */
-    @Transactional
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
     public void markPublished(OutboxMessage message) {
         Instant now = clock.instant();
         int changed = update("""
@@ -189,7 +197,8 @@ public class PostgresOutboxRepository {
      * @param errorCode stable redaction-safe error code
      * @param retryable whether another bounded attempt may be made
      */
-    @Transactional
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
     public void markFailed(OutboxMessage message, String errorCode, boolean retryable) {
         if (!retryable) {
             update("""
@@ -248,7 +257,8 @@ public class PostgresOutboxRepository {
      *
      * @return number of events recovered
      */
-    @Transactional
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
     public int recoverDueDead() {
         Instant now = clock.instant();
         List<OutboxMessage> due = jdbc.query(

@@ -18,8 +18,8 @@ import za.co.shapeitsolutions.portfolio.resilientpay.domain.reversal.ReversalCom
 import za.co.shapeitsolutions.portfolio.resilientpay.domain.shared.TenantId;
 
 /**
- * Owns atomic persistence and process-manager mutations behind a replaceable hexagonal port.
- * Implementations must enforce tenant predicates and idempotency at their transaction boundary.
+ * Persists process-manager mutations in the application-supplied transaction. Implementations
+ * enforce tenant predicates, locking and idempotency without choosing transaction lifetime.
  *
  * @author Daniel Jr Nkulu
  */
