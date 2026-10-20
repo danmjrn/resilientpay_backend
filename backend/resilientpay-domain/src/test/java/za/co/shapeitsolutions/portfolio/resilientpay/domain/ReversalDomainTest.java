@@ -96,6 +96,102 @@ class ReversalDomainTest {
     }
 
     @Test
+    void snapshottedRetryCeilingRejectsAnotherAttemptAfterTheFinalPermittedAttempt() {
+        ReversalCommand command = executingCommand();
+        ExecutionAttempt penultimate =
+                attempt(command, 2).confirmNotExecuted("SWITCH_NOT_RECEIVED", NOW.plusSeconds(3));
+        ExecutionAttempt exhausted = attempt(command, 3).confirmNotExecuted("SWITCH_NOT_RECEIVED", NOW.plusSeconds(3));
+
+        assertEquals(
+                ReversalCommandState.RETRY_SCHEDULED,
+                command.scheduleSafeRetry(NonExecutionEvidence.from(penultimate), NOW.plusSeconds(4))
+                        .state());
+        DomainException failure = assertThrows(
+                DomainException.class,
+                () -> command.scheduleSafeRetry(NonExecutionEvidence.from(exhausted), NOW.plusSeconds(4)));
+
+        assertEquals(DomainErrorCode.ATTEMPT_LIMIT_EXCEEDED, failure.code());
+        assertEquals(3, command.retryPolicySnapshot().maximumExecutionAttempts());
+        assertEquals(ReversalCommandState.EXECUTING, command.state());
+    }
+
+    @Test
+    void earlierExecutionWindowEvidenceCannotAuthoriseRetryOrRejection() {
+        ReversalCommand command = executingCommand();
+        NonExecutionEvidence previousEvidence = NonExecutionEvidence.from(
+                attempt(command, 1).confirmNotExecuted("SWITCH_NOT_RECEIVED", NOW.plusSeconds(3)));
+        ReversalCommand secondExecution = command.scheduleSafeRetry(previousEvidence, NOW.plusSeconds(4))
+                .releaseScheduledRetry(NOW.plusSeconds(5))
+                .startExecution(NOW.plusSeconds(6));
+
+        assertEvidenceRejected(secondExecution, previousEvidence, NOW.plusSeconds(7));
+    }
+
+    @Test
+    void anotherCommandEvidenceCannotAuthoriseRetryOrRejection() {
+        ReversalCommand command = executingCommand();
+        NonExecutionEvidence foreignEvidence = NonExecutionEvidence.from(
+                attempt(executingCommand(), 1).confirmNotExecuted("SWITCH_NOT_RECEIVED", NOW.plusSeconds(3)));
+
+        assertEvidenceRejected(command, foreignEvidence, NOW.plusSeconds(4));
+    }
+
+    @Test
+    void futureEvidenceCannotAuthoriseRetryOrRejection() {
+        ReversalCommand command = executingCommand();
+        NonExecutionEvidence futureEvidence = NonExecutionEvidence.from(
+                attempt(command, 1).confirmNotExecuted("SWITCH_NOT_RECEIVED", NOW.plusSeconds(5)));
+
+        assertEvidenceRejected(command, futureEvidence, NOW.plusSeconds(4));
+    }
+
+    @Test
+    void contradictoryMatchingTerminalEvidenceWithdrawsScheduledRetry() {
+        ReversalCommand command = executingCommand();
+        ExecutionAttempt notExecuted =
+                attempt(command, 1).confirmNotExecuted("SWITCH_NOT_RECEIVED", NOW.plusSeconds(3));
+        ReversalCommand scheduled =
+                command.scheduleSafeRetry(NonExecutionEvidence.from(notExecuted), NOW.plusSeconds(4));
+
+        ReversalCommand uncertain =
+                scheduled.requireReconciliationForConflictingOutcome(notExecuted, NOW.plusSeconds(5));
+
+        assertEquals(ReversalCommandState.RECONCILIATION_REQUIRED, uncertain.state());
+        assertEquals("CONTRADICTORY_OUTCOME", uncertain.failureCode().orElseThrow());
+        assertEquals(scheduled.version() + 1, uncertain.version());
+        ExecutionAttempt ambiguous = attempt(command, 1).markAmbiguous("SWITCH_OUTCOME_UNKNOWN", NOW.plusSeconds(3));
+        ReversalCommand reconciledRetry = command.requireReconciliation(ambiguous, NOW.plusSeconds(4))
+                .scheduleRetryFromReconciliation(1, "RECONCILIATION_CONFIRMED_NOT_EXECUTED", NOW.plusSeconds(5));
+        assertEquals(
+                ReversalCommandState.RECONCILIATION_REQUIRED,
+                reconciledRetry
+                        .requireReconciliationForConflictingOutcome(ambiguous, NOW.plusSeconds(6))
+                        .state());
+    }
+
+    @Test
+    void conflictTransitionRejectsForeignOrNonTerminalAttemptEvidence() {
+        ReversalCommand command = executingCommand();
+        ExecutionAttempt notExecuted =
+                attempt(command, 1).confirmNotExecuted("SWITCH_NOT_RECEIVED", NOW.plusSeconds(3));
+        ReversalCommand scheduled =
+                command.scheduleSafeRetry(NonExecutionEvidence.from(notExecuted), NOW.plusSeconds(4));
+        ExecutionAttempt foreign =
+                attempt(executingCommand(), 1).confirmNotExecuted("SWITCH_NOT_RECEIVED", NOW.plusSeconds(3));
+
+        DomainException foreignFailure = assertThrows(
+                DomainException.class,
+                () -> scheduled.requireReconciliationForConflictingOutcome(foreign, NOW.plusSeconds(5)));
+        DomainException activeFailure = assertThrows(
+                DomainException.class,
+                () -> scheduled.requireReconciliationForConflictingOutcome(attempt(command, 1), NOW.plusSeconds(5)));
+
+        assertEquals(DomainErrorCode.TENANT_SCOPE_MISMATCH, foreignFailure.code());
+        assertEquals(DomainErrorCode.INVALID_VALUE, activeFailure.code());
+        assertEquals(ReversalCommandState.RETRY_SCHEDULED, scheduled.state());
+    }
+
+    @Test
     void ambiguityRequiresReconciliationAndDistinctChecker() {
         ReversalCommand command = executingCommand();
         ExecutionAttempt ambiguous =
@@ -133,6 +229,22 @@ class ReversalDomainTest {
     }
 
     @Test
+    void reconciliationCannotExceedTheAcceptanceTimeAttemptCeiling() {
+        ReversalCommand command = executingCommand();
+        ExecutionAttempt ambiguous =
+                attempt(command, 3).markAmbiguous("INTERRUPTED_AFTER_DISPATCH", NOW.plusSeconds(3));
+        ReversalCommand awaitingDecision = command.requireReconciliation(ambiguous, NOW.plusSeconds(4));
+
+        DomainException failure = assertThrows(
+                DomainException.class,
+                () -> awaitingDecision.scheduleRetryFromReconciliation(
+                        3, "RECONCILIATION_CONFIRMED_NOT_EXECUTED", NOW.plusSeconds(7)));
+
+        assertEquals(DomainErrorCode.ATTEMPT_LIMIT_EXCEEDED, failure.code());
+        assertEquals(ReversalCommandState.RECONCILIATION_REQUIRED, awaitingDecision.state());
+    }
+
+    @Test
     void executionAttemptLimitIsFiveAcrossPolicyAndAttemptIdentity() {
         RetryPolicy boundary = new RetryPolicy(5, Duration.ofSeconds(5), Duration.ofMillis(250), Duration.ofSeconds(2));
         ExecutionAttempt fifth = ExecutionAttempt.create(
@@ -159,6 +271,18 @@ class ReversalDomainTest {
                         NOW.plusSeconds(5)));
         assertEquals(DomainErrorCode.INVALID_VALUE, policyOverflow.code());
         assertEquals(DomainErrorCode.INVALID_VALUE, attemptOverflow.code());
+    }
+
+    private static void assertEvidenceRejected(
+            ReversalCommand command, NonExecutionEvidence evidence, Instant decisionAt) {
+        DomainException retryFailure =
+                assertThrows(DomainException.class, () -> command.scheduleSafeRetry(evidence, decisionAt));
+        DomainException rejectionFailure = assertThrows(
+                DomainException.class, () -> command.rejectAfterNonExecution(evidence, "SWITCH_REJECTED", decisionAt));
+
+        assertEquals(DomainErrorCode.RETRY_NOT_PROVEN_SAFE, retryFailure.code());
+        assertEquals(DomainErrorCode.RETRY_NOT_PROVEN_SAFE, rejectionFailure.code());
+        assertEquals(ReversalCommandState.EXECUTING, command.state());
     }
 
     private static ReversalCommand executingCommand() {

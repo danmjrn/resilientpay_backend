@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import org.springframework.context.annotation.Profile;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Propagation;
@@ -115,6 +116,10 @@ public class PostgresOutboxRepository implements OutboxStore {
         if (!"ReversalExecutionRequested.v1".equals(message.eventType())) {
             return message;
         }
+        String commandState = lockCommandState(message);
+        if (!"EXECUTION_PENDING".equals(commandState) && !"EXECUTING".equals(commandState)) {
+            throw new ExecutionPublicationSuppressedException();
+        }
         Long resultTimeoutMillis = jdbc.queryForObject("""
                 SELECT result_timeout_ms_snapshot
                 FROM reversal_command
@@ -127,7 +132,7 @@ public class PostgresOutboxRepository implements OutboxStore {
                 WHERE id = ? AND tenant_id = ? AND status = 'CLAIMED' AND lease_owner = ?
                 """, deadline.toString(), message.id(), message.tenantId(), workerId);
         if (changed != 1) {
-            throw new IllegalStateException("Outbox lease was lost before dispatch preparation");
+            throw new ExecutionPublicationSuppressedException();
         }
         String payload = jdbc.queryForObject(
                 "SELECT payload::text FROM outbox_event WHERE id = ? AND tenant_id = ?",
@@ -156,15 +161,31 @@ public class PostgresOutboxRepository implements OutboxStore {
     @Transactional(propagation = Propagation.MANDATORY)
     public void markPublished(OutboxMessage message) {
         Instant now = clock.instant();
+        boolean execution = "ReversalExecutionRequested.v1".equals(message.eventType());
+        if (execution) {
+            // Outcome application owns command -> attempt -> outbox. Taking the command first
+            // serializes confirmation with both outcome application and conflict cancellation.
+            lockCommandState(message);
+        }
         int changed = update("""
                 UPDATE outbox_event
                 SET status = 'PUBLISHED', published_at = ?, lease_owner = NULL, lease_until = NULL
                 WHERE id = ? AND tenant_id = ? AND status = 'CLAIMED' AND lease_owner = ?
                 """, now, message.id(), message.tenantId(), workerId);
         if (changed != 1) {
-            throw new IllegalStateException("Outbox lease was lost before confirmation");
+            // Preparation commits before broker I/O. A conflict may cancel the lease after
+            // preparation, but a subsequent broker confirmation is still durable send evidence.
+            changed = execution ? update("""
+                    UPDATE outbox_event
+                    SET status = 'PUBLISHED', published_at = ?, lease_owner = NULL, lease_until = NULL
+                    WHERE id = ? AND tenant_id = ? AND status = 'DEAD' AND NOT retryable
+                      AND last_error_code = 'CONTRADICTORY_OUTCOME'
+                    """, now, message.id(), message.tenantId()) : 0;
+            if (changed != 1) {
+                throw new IllegalStateException("Outbox lease was lost before confirmation");
+            }
         }
-        if (!"ReversalExecutionRequested.v1".equals(message.eventType())) {
+        if (!execution) {
             return;
         }
         // Keep the aggregate/attempt lock order identical to processOutcome. The broker can
@@ -210,13 +231,37 @@ public class PostgresOutboxRepository implements OutboxStore {
             return;
         }
         if (message.attemptCount() >= properties.maxAttempts()) {
-            Integer currentRecoveryCycle =
-                    jdbc.queryForObject("""
+            Integer currentRecoveryCycle;
+            try {
+                currentRecoveryCycle =
+                        jdbc.queryForObject("""
                     SELECT recovery_cycle_count
                     FROM outbox_event
                     WHERE id = ? AND tenant_id = ? AND status = 'CLAIMED' AND lease_owner = ?
                     FOR UPDATE
                     """, Integer.class, message.id(), message.tenantId(), workerId);
+            } catch (EmptyResultDataAccessException missingLease) {
+                // A contradictory outcome may revoke a prepared lease during broker I/O.
+                // Only this exact durable cancellation (including later confirmation) is
+                // expected; missing rows and leases owned by another publisher still fail.
+                Boolean cancelled = jdbc.query(
+                        """
+                        SELECT id FROM outbox_event
+                        WHERE id = ? AND tenant_id = ? AND aggregate_id = ? AND event_type = ?
+                          AND status IN ('DEAD', 'PUBLISHED') AND NOT retryable
+                          AND last_error_code = 'CONTRADICTORY_OUTCOME'
+                        FOR UPDATE
+                        """,
+                        resultSet -> resultSet.next() ? Boolean.TRUE : Boolean.FALSE,
+                        message.id(),
+                        message.tenantId(),
+                        message.aggregateId(),
+                        message.eventType());
+                if (Boolean.TRUE.equals(cancelled)) {
+                    return;
+                }
+                throw missingLease;
+            }
             int recoveryCycle = Objects.requireNonNull(currentRecoveryCycle);
             if (recoveryCycle >= properties.maxRecoveryCycles()) {
                 recoveryAudit.recordTerminalFailure(message, recoveryCycle, errorCode);
@@ -313,6 +358,12 @@ public class PostgresOutboxRepository implements OutboxStore {
         long multiplier = 1L << Math.min(attempt - 1, 10);
         Duration candidate = properties.pollDelay().multipliedBy(multiplier);
         return candidate.compareTo(Duration.ofSeconds(30)) > 0 ? Duration.ofSeconds(30) : candidate;
+    }
+
+    private String lockCommandState(OutboxMessage message) {
+        return jdbc.queryForObject("""
+                SELECT state FROM reversal_command WHERE tenant_id = ? AND id = ? FOR UPDATE
+                """, String.class, message.tenantId(), message.aggregateId());
     }
 
     private int update(String sql, Object... arguments) {

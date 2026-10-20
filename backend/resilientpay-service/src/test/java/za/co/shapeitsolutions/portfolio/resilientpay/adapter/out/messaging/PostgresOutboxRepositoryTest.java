@@ -30,6 +30,12 @@ class PostgresOutboxRepositoryTest {
                 JdbcOperations.class.getClassLoader(),
                 new Class<?>[] {JdbcOperations.class},
                 (proxy, method, arguments) -> {
+                    if ("queryForObject".equals(method.getName())
+                            && ((String) arguments[0]).contains("FROM reversal_command")
+                            && ((String) arguments[0]).contains("FOR UPDATE")) {
+                        updatedTables.add("reversal_command_lock");
+                        return "EXECUTION_PENDING";
+                    }
                     if (!"update".equals(method.getName())) {
                         throw new UnsupportedOperationException(method.getName());
                     }
@@ -68,6 +74,8 @@ class PostgresOutboxRepositoryTest {
 
         repository.markPublished(message);
 
-        assertEquals(List.of("outbox_event", "reversal_command", "execution_attempt"), updatedTables);
+        assertEquals(
+                List.of("reversal_command_lock", "outbox_event", "reversal_command", "execution_attempt"),
+                updatedTables);
     }
 }

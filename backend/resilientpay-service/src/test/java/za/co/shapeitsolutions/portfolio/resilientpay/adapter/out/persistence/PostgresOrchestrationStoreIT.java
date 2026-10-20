@@ -3,6 +3,7 @@ package za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.persistence;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,7 +35,11 @@ import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.aop.framework.ProxyFactory;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
@@ -46,6 +51,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
+import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.ExecutionPublicationSuppressedException;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.PostgresOutboxRepository;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.QuarantineMetrics;
 import za.co.shapeitsolutions.portfolio.resilientpay.adapter.out.messaging.RabbitTraceContext;
@@ -65,6 +71,7 @@ import za.co.shapeitsolutions.portfolio.resilientpay.application.model.RetryReve
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.AuditStore;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.out.IndependentAuditPort;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.service.AuditApplicationService;
+import za.co.shapeitsolutions.portfolio.resilientpay.application.service.OutboxApplicationService;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.service.ReversalApplicationService;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.OutboxProperties;
 import za.co.shapeitsolutions.portfolio.resilientpay.bootstrap.config.ReconciliationProperties;
@@ -572,6 +579,563 @@ class PostgresOrchestrationStoreIT {
                         """, Integer.class, proposed.id()));
     }
 
+    @ParameterizedTest
+    @EnumSource(
+            value = ReconciliationDecision.class,
+            names = {"CONFIRM_EXECUTED", "CONFIRM_NOT_EXECUTED", "QUARANTINE"})
+    void approvedReconciliationDecisionsCommitOnceWithoutDuplicatingDispatch(ReconciliationDecision decision) {
+        String suffix = decision.name().toLowerCase(java.util.Locale.ROOT).replace('_', '-');
+        String token = "synth-approved-" + suffix;
+        UUID originalId = insertSyntheticOriginal(token, OperationType.CARD_PURCHASE, "120");
+        ActorContext maker = actorWithAcr("maker-" + suffix);
+        ActorContext checker = actorWithAcr("checker-" + suffix);
+        AcceptanceResult accepted = transaction(() -> store.accept(
+                maker, acceptance(token, OperationType.CARD_PURCHASE, "120", "accept-" + suffix, UUID.randomUUID())));
+        UUID commandId = accepted.command().id();
+        UUID attemptId = latestAttemptId(commandId);
+        process(outcome(accepted, attemptId, UUID.randomUUID(), "d".repeat(64), "AMBIGUOUS", "SWITCH_OUTCOME_UNKNOWN"));
+        ReconciliationCaseView opened = transaction(() -> store.listReconciliationCases(TENANT)).stream()
+                .filter(item -> item.reversalCommandId().equals(commandId))
+                .findFirst()
+                .orElseThrow();
+        AuditEvidenceView evidence =
+                transaction(() -> store.evidence(TENANT, commandId)).getFirst();
+        ReconciliationCaseView proposed = transaction(() -> store.propose(
+                maker,
+                new ProposeReconciliationCommand(
+                        opened.id(),
+                        decision,
+                        "Review synthetic approved decision",
+                        evidence.digest(),
+                        "propose-" + suffix,
+                        new CorrelationId(UUID.randomUUID()))));
+        Map<String, Object> ambiguousAttempt = attemptRow(attemptId);
+        Map<String, Object> reservation = reservationRow(commandId);
+        ApproveReconciliationCommand approval = new ApproveReconciliationCommand(
+                proposed.id(),
+                "Approve synthetic reviewed decision",
+                "approve-" + suffix,
+                new CorrelationId(UUID.randomUUID()));
+
+        ReconciliationCaseView approved = transaction(() -> store.approve(checker, approval));
+
+        String expectedCommandState =
+                switch (decision) {
+                    case CONFIRM_EXECUTED -> "COMPLETED";
+                    case CONFIRM_NOT_EXECUTED -> "RETRY_SCHEDULED";
+                    case QUARANTINE -> "QUARANTINED";
+                    default -> throw new AssertionError("Unexpected decision");
+                };
+        assertEquals(expectedCommandState, commandRow(commandId).get("state"));
+        assertEquals(
+                decision == ReconciliationDecision.QUARANTINE ? "QUARANTINED" : "RESOLVED",
+                approved.status().name());
+        assertNotNull(approved.resolvedAt());
+        assertEquals(decision.name(), approved.proposedDecision());
+        assertEquals(
+                decision == ReconciliationDecision.CONFIRM_EXECUTED ? "REVERSED" : "REVERSAL_RESERVED",
+                originalState(originalId));
+        assertEquals(ambiguousAttempt, attemptRow(attemptId), "Approval must preserve the original ambiguous evidence");
+        assertEquals("OUTCOME_UNKNOWN", ambiguousAttempt.get("state"));
+        assertEquals("AMBIGUOUS", ambiguousAttempt.get("result_code"));
+        assertEquals(reservation, reservationRow(commandId));
+        assertNull(reservation.get("released_at"));
+        assertEquals(1, attemptCount(commandId));
+        assertEquals(1, executionRequestCount(commandId));
+        assertEquals(
+                decision == ReconciliationDecision.CONFIRM_EXECUTED ? 4 : 3, logicalOutboxCount(originalId, commandId));
+        Map<String, Object> durableDecision = jdbc.queryForMap(
+                "SELECT * FROM reconciliation_decision WHERE reconciliation_case_id = ?", proposed.id());
+        assertEquals(maker.actorId().value(), durableDecision.get("proposed_by"));
+        assertEquals(checker.actorId().value(), durableDecision.get("approved_by"));
+        assertEquals(decision.name(), durableDecision.get("proposed_outcome"));
+        assertEquals(evidence.digest(), durableDecision.get("evidence_digest"));
+        assertNotNull(durableDecision.get("approved_at"));
+        assertEquals(1, auditActionCount(commandId, "SWITCH_OUTCOME_AMBIGUOUS"));
+        assertEquals(1, auditActionCount(commandId, "RECONCILIATION_PROPOSED"));
+        assertEquals(
+                1,
+                auditActionCount(
+                        commandId,
+                        decision == ReconciliationDecision.QUARANTINE
+                                ? "RECONCILIATION_QUARANTINED"
+                                : "RECONCILIATION_RESOLVED"));
+        if (decision == ReconciliationDecision.CONFIRM_NOT_EXECUTED) {
+            assertEquals(
+                    "RECONCILIATION_CONFIRMED_NOT_EXECUTED",
+                    commandRow(commandId).get("failure_code"));
+            assertNotNull(commandRow(commandId).get("next_attempt_at"));
+        } else {
+            assertNull(commandRow(commandId).get("next_attempt_at"));
+        }
+        if (decision == ReconciliationDecision.CONFIRM_EXECUTED) {
+            assertEquals(1, jdbc.queryForObject("""
+                    SELECT COUNT(*) FROM outbox_event
+                    WHERE aggregate_id = ? AND event_type = 'OriginalTransactionStatusChanged.v1'
+                      AND payload->>'status' = 'REVERSED'
+                    """, Integer.class, originalId));
+        }
+        Map<String, Object> commandAfterApproval = commandRow(commandId);
+        Map<String, Object> caseAfterApproval =
+                jdbc.queryForMap("SELECT * FROM reconciliation_case WHERE id = ?", proposed.id());
+        List<Map<String, Object>> outboxAfterApproval = logicalOutboxRows(originalId, commandId);
+
+        assertEquals(approved, transaction(() -> store.approve(checker, approval)));
+
+        assertEquals(commandAfterApproval, commandRow(commandId));
+        assertEquals(
+                caseAfterApproval, jdbc.queryForMap("SELECT * FROM reconciliation_case WHERE id = ?", proposed.id()));
+        assertEquals(
+                durableDecision,
+                jdbc.queryForMap(
+                        "SELECT * FROM reconciliation_decision WHERE reconciliation_case_id = ?", proposed.id()));
+        assertEquals(outboxAfterApproval, logicalOutboxRows(originalId, commandId));
+        assertEquals(
+                1,
+                jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM idempotency_record WHERE key_hash = ?",
+                        Integer.class,
+                        sha256(approval.idempotencyKey())));
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT COUNT(*) FROM audit_event
+                WHERE resource_id = ? AND action = 'RECONCILIATION_APPROVAL_REPLAYED'
+                """, Integer.class, proposed.id()));
+        if (decision == ReconciliationDecision.CONFIRM_NOT_EXECUTED) {
+            makeRetryDue(commandId);
+            RetryReversalCommand retry = retryRequest(commandId, "retry-" + suffix);
+            assertEquals(2, transaction(() -> store.retry(maker, retry)).attemptCount());
+            assertEquals(2, transaction(() -> store.retry(maker, retry)).attemptCount());
+            assertEquals(2, attemptCount(commandId));
+            assertEquals(2, executionRequestCount(commandId));
+            OutcomeObservation executed = outcome(
+                    accepted,
+                    latestAttemptId(commandId),
+                    UUID.randomUUID(),
+                    "e".repeat(64),
+                    "EXECUTED",
+                    "SWITCH_EXECUTED");
+            process(executed);
+            process(executed);
+            assertEquals("COMPLETED", commandRow(commandId).get("state"));
+            assertEquals("REVERSED", originalState(originalId));
+            assertEquals(2, attemptCount(commandId));
+            assertEquals(2, executionRequestCount(commandId));
+            assertEquals(1, auditActionCount(commandId, "SWITCH_EXECUTED"));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void distinctMessageContradictionsPreserveEvidenceAndPreventUnsafeRetry(boolean executedFirst) {
+        String suffix = executedFirst ? "executed-first" : "not-executed-first";
+        String token = "synth-contradiction-" + suffix;
+        UUID originalId = insertSyntheticOriginal(token, OperationType.CARD_PURCHASE, "120");
+        AcceptanceResult accepted = transaction(() -> store.accept(
+                actor("contradiction-operator"),
+                acceptance(token, OperationType.CARD_PURCHASE, "120", "accept-" + suffix, UUID.randomUUID())));
+        UUID commandId = accepted.command().id();
+        UUID attemptId = latestAttemptId(commandId);
+        OutcomeObservation first = outcome(
+                accepted,
+                attemptId,
+                UUID.randomUUID(),
+                "a".repeat(64),
+                executedFirst ? "EXECUTED" : "CONFIRMED_NOT_EXECUTED",
+                "SWITCH_FIRST_RESULT");
+        OutcomeObservation conflicting = outcome(
+                accepted,
+                attemptId,
+                UUID.randomUUID(),
+                "b".repeat(64),
+                executedFirst ? "CONFIRMED_NOT_EXECUTED" : "EXECUTED",
+                "SWITCH_CONFLICTING_RESULT");
+        markLatestExecutionPublished(commandId, attemptId);
+        process(first);
+        Map<String, Object> firstCommand = commandRow(commandId);
+        Map<String, Object> firstAttempt = attemptRow(attemptId);
+        Map<String, Object> firstOriginal =
+                jdbc.queryForMap("SELECT * FROM original_transaction WHERE id = ?", originalId);
+        Map<String, Object> firstReservation = reservationRow(commandId);
+        List<Map<String, Object>> firstOutbox = logicalOutboxRows(originalId, commandId);
+
+        process(conflicting);
+        process(conflicting);
+        process(first);
+
+        assertNotEquals(first.messageId(), conflicting.messageId());
+        assertEquals(
+                executedFirst ? "COMPLETED" : "RECONCILIATION_REQUIRED",
+                commandRow(commandId).get("state"));
+        assertEquals(
+                executedFirst ? "SUCCEEDED" : "KNOWN_NOT_SENT",
+                attemptRow(attemptId).get("state"));
+        assertEquals(first.outcome(), attemptRow(attemptId).get("result_code"));
+        if (executedFirst) {
+            assertEquals(firstCommand, commandRow(commandId));
+        } else {
+            assertEquals("CONTRADICTORY_OUTCOME", commandRow(commandId).get("failure_code"));
+            assertNull(commandRow(commandId).get("next_attempt_at"));
+            assertEquals(
+                    "OPEN",
+                    jdbc.queryForObject(
+                            "SELECT state FROM reconciliation_case WHERE reversal_command_id = ?",
+                            String.class,
+                            commandId));
+        }
+        assertEquals(firstAttempt, attemptRow(attemptId));
+        assertEquals(firstOriginal, jdbc.queryForMap("SELECT * FROM original_transaction WHERE id = ?", originalId));
+        assertEquals(firstReservation, reservationRow(commandId));
+        assertEquals(firstOutbox, logicalOutboxRows(originalId, commandId));
+        assertEquals(1, attemptCount(commandId));
+        assertEquals(1, executionRequestCount(commandId));
+        assertEquals(
+                executedFirst ? 0 : 1,
+                jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM reconciliation_case WHERE reversal_command_id = ?",
+                        Integer.class,
+                        commandId));
+        assertEquals(2, jdbc.queryForObject("""
+                SELECT COUNT(*) FROM inbox_message
+                WHERE message_id IN (?, ?) AND processing_outcome = 'PROCESSED'
+                """, Integer.class, first.messageId(), conflicting.messageId()));
+        Map<String, Object> quarantine = jdbc.queryForMap(
+                "SELECT * FROM message_quarantine WHERE message_id = ?",
+                conflicting.messageId().toString());
+        assertEquals("CONTRADICTORY_OUTCOME", quarantine.get("error_code"));
+        assertEquals("OPEN", quarantine.get("state"));
+        assertEquals(conflicting.payloadHash(), quarantine.get("payload_digest"));
+        assertEquals(1, ((Number) quarantine.get("occurrence_count")).intValue());
+        assertEquals(1, auditActionCount(commandId, "CONTRADICTORY_SWITCH_OUTCOME"));
+        assertEquals(
+                1, auditActionCount(commandId, executedFirst ? "SWITCH_EXECUTED" : "SWITCH_CONFIRMED_NOT_EXECUTED"));
+        if (!executedFirst) {
+            assertFalse(transaction(() -> store.getReversal(TENANT, commandId))
+                    .allowedActions()
+                    .contains("REQUEST_SAFE_RETRY"));
+            assertTrue(transaction(() -> store.getReversal(TENANT, commandId))
+                    .allowedActions()
+                    .contains("CHECK_OUTCOME"));
+            makeRetryDue(commandId);
+            ApplicationException retryFailure = assertThrows(
+                    ApplicationException.class,
+                    () -> transaction(() -> store.retry(
+                            actor("contradiction-operator"), retryRequest(commandId, "retry-after-contradiction"))));
+            assertEquals(ApplicationErrorCode.STATE_TRANSITION_NOT_ALLOWED, retryFailure.code());
+            assertEquals(1, executionRequestCount(commandId));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void exhaustedNonExecutionCommitsTerminalRejectionWithoutAnotherDispatch(boolean confirmedByReconciliation) {
+        String suffix = confirmedByReconciliation ? "reconciled" : "direct";
+        String token = "synth-exhausted-retry-" + suffix;
+        UUID originalId = insertSyntheticOriginal(token, OperationType.CARD_PURCHASE, "120");
+        ActorContext actor = actor("exhausted-retry-operator");
+        AcceptanceResult accepted = transaction(() -> store.accept(
+                actor,
+                acceptance(
+                        token, OperationType.CARD_PURCHASE, "120", "accept-exhausted-" + suffix, UUID.randomUUID())));
+        UUID commandId = accepted.command().id();
+        assertEquals(3, ((Number) commandRow(commandId).get("max_attempts_snapshot")).intValue());
+        for (int completedAttempt = 1; completedAttempt < 3; completedAttempt++) {
+            process(outcome(
+                    accepted,
+                    latestAttemptId(commandId),
+                    UUID.randomUUID(),
+                    "c".repeat(64),
+                    "CONFIRMED_NOT_EXECUTED",
+                    "SWITCH_NOT_RECEIVED"));
+            makeRetryDue(commandId);
+            RetryReversalCommand retry = retryRequest(commandId, "exhausted-" + suffix + "-" + completedAttempt);
+            assertEquals(
+                    completedAttempt + 1,
+                    transaction(() -> store.retry(actor, retry)).attemptCount());
+        }
+        UUID finalAttemptId = latestAttemptId(commandId);
+        markLatestExecutionPublished(commandId, finalAttemptId);
+        assertEquals("EXECUTING", commandRow(commandId).get("state"));
+        assertEquals("DISPATCHED", attemptRow(finalAttemptId).get("state"));
+        int outboxBefore = logicalOutboxCount(originalId, commandId);
+        OutcomeObservation exhausted = outcome(
+                accepted,
+                finalAttemptId,
+                UUID.randomUUID(),
+                "f".repeat(64),
+                confirmedByReconciliation ? "AMBIGUOUS" : "CONFIRMED_NOT_EXECUTED",
+                confirmedByReconciliation ? "SWITCH_OUTCOME_UNKNOWN" : "SWITCH_NOT_RECEIVED");
+
+        process(exhausted);
+        process(exhausted);
+        if (confirmedByReconciliation) {
+            ReconciliationCaseView opened = transaction(() -> store.listReconciliationCases(TENANT)).stream()
+                    .filter(item -> item.reversalCommandId().equals(commandId))
+                    .findFirst()
+                    .orElseThrow();
+            AuditEvidenceView evidence =
+                    transaction(() -> store.evidence(TENANT, commandId)).getFirst();
+            transaction(() -> store.propose(
+                    actor,
+                    new ProposeReconciliationCommand(
+                            opened.id(),
+                            ReconciliationDecision.CONFIRM_NOT_EXECUTED,
+                            "Review exhausted attempt non-execution",
+                            evidence.digest(),
+                            "propose-exhausted-reconciled",
+                            new CorrelationId(UUID.randomUUID()))));
+            ApproveReconciliationCommand approval = new ApproveReconciliationCommand(
+                    opened.id(),
+                    "Approve exhausted attempt non-execution",
+                    "approve-exhausted-reconciled",
+                    new CorrelationId(UUID.randomUUID()));
+            ReconciliationCaseView approved =
+                    transaction(() -> store.approve(actorWithAcr("exhaustion-checker"), approval));
+            assertEquals("RESOLVED", approved.status().name());
+            assertEquals(approved, transaction(() -> store.approve(actorWithAcr("exhaustion-checker"), approval)));
+        }
+
+        assertEquals("REJECTED", commandRow(commandId).get("state"));
+        assertEquals("ATTEMPT_LIMIT_EXCEEDED", commandRow(commandId).get("failure_code"));
+        assertEquals(
+                confirmedByReconciliation ? "OUTCOME_UNKNOWN" : "KNOWN_NOT_SENT",
+                attemptRow(finalAttemptId).get("state"));
+        assertEquals(
+                confirmedByReconciliation ? "AMBIGUOUS" : "CONFIRMED_NOT_EXECUTED",
+                attemptRow(finalAttemptId).get("result_code"));
+        assertEquals(outboxBefore + 1, logicalOutboxCount(originalId, commandId));
+        assertEquals("POSTED", originalState(originalId));
+        assertNotNull(reservationRow(commandId).get("released_at"));
+        assertEquals(3, attemptCount(commandId));
+        assertEquals(3, executionRequestCount(commandId));
+        assertEquals(
+                1,
+                jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM inbox_message WHERE message_id = ?",
+                        Integer.class,
+                        exhausted.messageId()));
+        assertEquals(2, auditActionCount(commandId, "SWITCH_CONFIRMED_NOT_EXECUTED"));
+        assertEquals(
+                1,
+                auditActionCount(
+                        commandId, confirmedByReconciliation ? "RECONCILIATION_RESOLVED" : "SWITCH_RETRY_EXHAUSTED"));
+        ApplicationException retryFailure = assertThrows(
+                ApplicationException.class,
+                () -> transaction(() -> store.retry(actor, retryRequest(commandId, "retry-beyond-ceiling"))));
+        assertEquals(ApplicationErrorCode.STATE_TRANSITION_NOT_ALLOWED, retryFailure.code());
+        assertEquals(3, executionRequestCount(commandId));
+    }
+
+    @Test
+    void contradictionAfterApprovedNonExecutionQuarantinesWithoutRewritingTheResolvedDecision() {
+        String token = "synth-approved-contradiction";
+        UUID originalId = insertSyntheticOriginal(token, OperationType.CARD_PURCHASE, "120");
+        ActorContext maker = actorWithAcr("approved-conflict-maker");
+        AcceptanceResult accepted = transaction(() -> store.accept(
+                maker,
+                acceptance(token, OperationType.CARD_PURCHASE, "120", "accept-approved-conflict", UUID.randomUUID())));
+        UUID commandId = accepted.command().id();
+        UUID attemptId = latestAttemptId(commandId);
+        markLatestExecutionPublished(commandId, attemptId);
+        process(outcome(accepted, attemptId, UUID.randomUUID(), "a".repeat(64), "AMBIGUOUS", "SWITCH_OUTCOME_UNKNOWN"));
+        ReconciliationCaseView opened = transaction(() -> store.listReconciliationCases(TENANT)).stream()
+                .filter(item -> item.reversalCommandId().equals(commandId))
+                .findFirst()
+                .orElseThrow();
+        AuditEvidenceView evidence =
+                transaction(() -> store.evidence(TENANT, commandId)).getFirst();
+        transaction(() -> store.propose(
+                maker,
+                new ProposeReconciliationCommand(
+                        opened.id(),
+                        ReconciliationDecision.CONFIRM_NOT_EXECUTED,
+                        "Review synthetic non-execution",
+                        evidence.digest(),
+                        "propose-approved-conflict",
+                        new CorrelationId(UUID.randomUUID()))));
+        transaction(() -> store.approve(
+                actorWithAcr("approved-conflict-checker"),
+                new ApproveReconciliationCommand(
+                        opened.id(),
+                        "Approve synthetic non-execution",
+                        "approve-approved-conflict",
+                        new CorrelationId(UUID.randomUUID()))));
+        assertEquals("RETRY_SCHEDULED", commandRow(commandId).get("state"));
+        Map<String, Object> priorCase = jdbc.queryForMap("SELECT * FROM reconciliation_case WHERE id = ?", opened.id());
+        Map<String, Object> priorDecision =
+                jdbc.queryForMap("SELECT * FROM reconciliation_decision WHERE reconciliation_case_id = ?", opened.id());
+        Map<String, Object> priorAttempt = attemptRow(attemptId);
+        Map<String, Object> priorReservation = reservationRow(commandId);
+        List<Map<String, Object>> priorOutbox = logicalOutboxRows(originalId, commandId);
+        OutcomeObservation conflicting = outcome(
+                accepted, attemptId, UUID.randomUUID(), "b".repeat(64), "EXECUTED", "SWITCH_CONFLICTING_RESULT");
+
+        process(conflicting);
+        process(conflicting);
+
+        assertEquals("QUARANTINED", commandRow(commandId).get("state"));
+        assertEquals("CONTRADICTORY_OUTCOME", commandRow(commandId).get("failure_code"));
+        assertNull(commandRow(commandId).get("next_attempt_at"));
+        assertEquals(priorCase, jdbc.queryForMap("SELECT * FROM reconciliation_case WHERE id = ?", opened.id()));
+        assertEquals("RESOLVED", priorCase.get("state"));
+        assertEquals(
+                priorDecision,
+                jdbc.queryForMap(
+                        "SELECT * FROM reconciliation_decision WHERE reconciliation_case_id = ?", opened.id()));
+        assertEquals(priorAttempt, attemptRow(attemptId));
+        assertEquals(priorReservation, reservationRow(commandId));
+        assertEquals("REVERSAL_RESERVED", originalState(originalId));
+        assertEquals(priorOutbox, logicalOutboxRows(originalId, commandId));
+        assertEquals(1, executionRequestCount(commandId));
+        assertEquals(1, auditActionCount(commandId, "CONTRADICTORY_SWITCH_OUTCOME"));
+        assertEquals(
+                1,
+                jdbc.queryForObject("""
+                SELECT COUNT(*) FROM message_quarantine
+                WHERE message_id = ? AND error_code = 'CONTRADICTORY_OUTCOME' AND state = 'OPEN'
+                """, Integer.class, conflicting.messageId().toString()));
+        assertThrows(
+                ApplicationException.class,
+                () -> transaction(() -> store.retry(maker, retryRequest(commandId, "retry-approved-conflict"))));
+        assertEquals(1, executionRequestCount(commandId));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"PENDING", "CLAIMED", "PREPARED", "DISPATCHED"})
+    void contradictionCancelsQueuedRetryButPreservesAlreadyInFlightDispatchEvidence(String publicationStage) {
+        String suffix = publicationStage.toLowerCase(java.util.Locale.ROOT);
+        String token = "synth-queued-conflict-" + suffix;
+        UUID originalId = insertSyntheticOriginal(token, OperationType.CARD_PURCHASE, "120");
+        ActorContext actor = actor("queued-conflict-operator");
+        AcceptanceResult accepted = transaction(() -> store.accept(
+                actor,
+                acceptance(token, OperationType.CARD_PURCHASE, "120", "accept-queued-" + suffix, UUID.randomUUID())));
+        UUID commandId = accepted.command().id();
+        UUID firstAttemptId = latestAttemptId(commandId);
+        markLatestExecutionPublished(commandId, firstAttemptId);
+        process(outcome(
+                accepted,
+                firstAttemptId,
+                UUID.randomUUID(),
+                "a".repeat(64),
+                "CONFIRMED_NOT_EXECUTED",
+                "SWITCH_NOT_RECEIVED"));
+        Map<String, Object> firstAttempt = attemptRow(firstAttemptId);
+        Map<String, Object> reservation = reservationRow(commandId);
+        makeRetryDue(commandId);
+        transaction(() -> store.retry(actor, retryRequest(commandId, "retry-queued-" + suffix)));
+        UUID secondAttemptId = latestAttemptId(commandId);
+        UUID secondEventId = executionEventId(commandId, secondAttemptId);
+        PostgresOutboxRepository repository = outboxRepository();
+        if ("PREPARED".equals(publicationStage)) {
+            jdbc.update("UPDATE outbox_event SET attempt_count = 2 WHERE id = ?", secondEventId);
+        }
+        OutboxMessage leased =
+                "PENDING".equals(publicationStage) ? null : claimExecution(repository, commandId, secondAttemptId);
+        OutboxMessage prepared = ("PREPARED".equals(publicationStage) || "DISPATCHED".equals(publicationStage))
+                ? transaction(() -> repository.prepareForPublish(leased))
+                : null;
+        if ("DISPATCHED".equals(publicationStage)) {
+            transaction(() -> {
+                repository.markPublished(prepared);
+                return null;
+            });
+        }
+        OutcomeObservation conflict = outcome(
+                accepted, firstAttemptId, UUID.randomUUID(), "b".repeat(64), "EXECUTED", "SWITCH_CONFLICTING_RESULT");
+
+        process(conflict);
+        process(conflict);
+
+        assertEquals("RECONCILIATION_REQUIRED", commandRow(commandId).get("state"));
+        assertEquals("CONTRADICTORY_OUTCOME", commandRow(commandId).get("failure_code"));
+        assertNull(commandRow(commandId).get("next_attempt_at"));
+        assertEquals(firstAttempt, attemptRow(firstAttemptId));
+        assertEquals(reservation, reservationRow(commandId));
+        assertEquals("REVERSAL_RESERVED", originalState(originalId));
+        assertEquals(2, attemptCount(commandId));
+        assertEquals(2, executionRequestCount(commandId));
+        Map<String, Object> cancelled = jdbc.queryForMap("SELECT * FROM outbox_event WHERE id = ?", secondEventId);
+        assertEquals("DISPATCHED".equals(publicationStage) ? "PUBLISHED" : "DEAD", cancelled.get("status"));
+        if (!"DISPATCHED".equals(publicationStage)) {
+            assertEquals(false, cancelled.get("retryable"));
+            assertEquals("CONTRADICTORY_OUTCOME", cancelled.get("last_error_code"));
+            assertNull(cancelled.get("lease_owner"));
+            assertNull(cancelled.get("lease_until"));
+            assertEquals(0, transaction(repository::recoverDueDead));
+            List<OutboxMessage> laterClaims = transactions.execute(status -> {
+                List<OutboxMessage> claims = repository.claimDue();
+                status.setRollbackOnly();
+                return claims;
+            });
+            assertFalse(laterClaims.stream().anyMatch(message -> message.id().equals(secondEventId)));
+        }
+        if (leased != null) {
+            assertThrows(
+                    ExecutionPublicationSuppressedException.class,
+                    () -> transaction(() -> repository.prepareForPublish(leased)));
+        }
+        assertThrows(
+                ApplicationException.class,
+                () -> transaction(() -> store.retry(actor, retryRequest(commandId, "retry-after-queued-" + suffix))));
+        assertEquals(1, auditActionCount(commandId, "CONTRADICTORY_SWITCH_OUTCOME"));
+        if ("PREPARED".equals(publicationStage)) {
+            assertEquals(3, prepared.attemptCount());
+            transaction(() -> {
+                repository.markFailed(prepared, "BROKER_UNAVAILABLE", true);
+                return null;
+            });
+            assertEquals(cancelled, jdbc.queryForMap("SELECT * FROM outbox_event WHERE id = ?", secondEventId));
+            // Preparation committed before conflict; a later broker confirmation is send
+            // evidence, not proof that cancellation recalled the already prepared message.
+            OutboxApplicationService operations = new OutboxApplicationService(boundary, repository, store);
+            operations.confirmPublished(prepared);
+            assertEquals(
+                    "PUBLISHED",
+                    jdbc.queryForObject("SELECT status FROM outbox_event WHERE id = ?", String.class, secondEventId));
+            assertEquals("DISPATCHED", attemptRow(secondAttemptId).get("state"));
+            assertEquals("RECONCILIATION_REQUIRED", commandRow(commandId).get("state"));
+            assertEquals(reservation, reservationRow(commandId));
+            assertEquals(1, auditActionCount(commandId, "OUTBOX_PUBLISH_CONFIRMED"));
+            Map<String, Object> confirmed = jdbc.queryForMap("SELECT * FROM outbox_event WHERE id = ?", secondEventId);
+            transaction(() -> {
+                repository.markFailed(prepared, "BROKER_UNAVAILABLE", true);
+                return null;
+            });
+            assertEquals(confirmed, jdbc.queryForMap("SELECT * FROM outbox_event WHERE id = ?", secondEventId));
+        }
+        assertEquals(2, executionRequestCount(commandId));
+    }
+
+    @Test
+    void finalHotAttemptFailureStillRejectsALeaseOwnedByAnotherPublisher() {
+        String token = "synth-foreign-publication-lease";
+        insertSyntheticOriginal(token, OperationType.CARD_PURCHASE, "120");
+        AcceptanceResult accepted = transaction(() -> store.accept(
+                actor("foreign-lease-operator"),
+                acceptance(token, OperationType.CARD_PURCHASE, "120", "accept-foreign-lease", UUID.randomUUID())));
+        UUID commandId = accepted.command().id();
+        UUID attemptId = latestAttemptId(commandId);
+        UUID eventId = executionEventId(commandId, attemptId);
+        jdbc.update("UPDATE outbox_event SET attempt_count = 2 WHERE id = ?", eventId);
+        PostgresOutboxRepository repository = outboxRepository();
+        OutboxMessage leased = claimExecution(repository, commandId, attemptId);
+        OutboxMessage prepared = transaction(() -> repository.prepareForPublish(leased));
+        assertEquals(3, prepared.attemptCount());
+        jdbc.update("UPDATE outbox_event SET lease_owner = 'different-publisher' WHERE id = ?", eventId);
+        Map<String, Object> foreignLease = jdbc.queryForMap("SELECT * FROM outbox_event WHERE id = ?", eventId);
+
+        assertThrows(
+                EmptyResultDataAccessException.class,
+                () -> transaction(() -> {
+                    repository.markFailed(prepared, "BROKER_UNAVAILABLE", true);
+                    return null;
+                }));
+
+        assertEquals(foreignLease, jdbc.queryForMap("SELECT * FROM outbox_event WHERE id = ?", eventId));
+        assertEquals("CLAIMED", foreignLease.get("status"));
+        assertEquals("different-publisher", foreignLease.get("lease_owner"));
+    }
+
     @Test
     void acceptedCommandRetainsImmutablePolicySnapshotAfterPolicyRowChanges() {
         String token = "synth-policy-snapshot-0001";
@@ -836,6 +1400,114 @@ class PostgresOrchestrationStoreIT {
     private static int logicalOutboxCount(UUID originalId, UUID commandId) {
         return jdbc.queryForObject(
                 "SELECT COUNT(*) FROM outbox_event WHERE aggregate_id IN (?, ?)", Integer.class, originalId, commandId);
+    }
+
+    private static List<Map<String, Object>> logicalOutboxRows(UUID originalId, UUID commandId) {
+        return jdbc.queryForList(
+                "SELECT * FROM outbox_event WHERE aggregate_id IN (?, ?) ORDER BY id", originalId, commandId);
+    }
+
+    private static Map<String, Object> commandRow(UUID commandId) {
+        return jdbc.queryForMap("SELECT * FROM reversal_command WHERE id = ?", commandId);
+    }
+
+    private static Map<String, Object> attemptRow(UUID attemptId) {
+        return jdbc.queryForMap("SELECT * FROM execution_attempt WHERE id = ?", attemptId);
+    }
+
+    private static Map<String, Object> reservationRow(UUID commandId) {
+        return jdbc.queryForMap("SELECT * FROM reversal_reservation WHERE reversal_command_id = ?", commandId);
+    }
+
+    private static UUID latestAttemptId(UUID commandId) {
+        return jdbc.queryForObject("""
+                SELECT id FROM execution_attempt
+                WHERE reversal_command_id = ? ORDER BY attempt_number DESC LIMIT 1
+                """, UUID.class, commandId);
+    }
+
+    private static int attemptCount(UUID commandId) {
+        return jdbc.queryForObject(
+                "SELECT COUNT(*) FROM execution_attempt WHERE reversal_command_id = ?", Integer.class, commandId);
+    }
+
+    private static int executionRequestCount(UUID commandId) {
+        return jdbc.queryForObject("""
+                SELECT COUNT(*) FROM outbox_event
+                WHERE aggregate_id = ? AND event_type = 'ReversalExecutionRequested.v1'
+                """, Integer.class, commandId);
+    }
+
+    private static int auditActionCount(UUID commandId, String action) {
+        return jdbc.queryForObject(
+                "SELECT COUNT(*) FROM audit_event WHERE resource_id = ? AND action = ?",
+                Integer.class,
+                commandId,
+                action);
+    }
+
+    private static void makeRetryDue(UUID commandId) {
+        jdbc.update(
+                "UPDATE reversal_command SET next_attempt_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+                commandId);
+    }
+
+    private static void markLatestExecutionPublished(UUID commandId, UUID attemptId) {
+        PostgresOutboxRepository repository = outboxRepository();
+        OutboxMessage leased = claimExecution(repository, commandId, attemptId);
+        transaction(() -> {
+            repository.markPublished(repository.prepareForPublish(leased));
+            return null;
+        });
+    }
+
+    private static UUID executionEventId(UUID commandId, UUID attemptId) {
+        return jdbc.queryForObject("""
+                SELECT id FROM outbox_event
+                WHERE aggregate_id = ? AND event_type = 'ReversalExecutionRequested.v1'
+                  AND payload->>'executionAttemptId' = ?
+                """, UUID.class, commandId, attemptId.toString());
+    }
+
+    private static OutboxMessage claimExecution(PostgresOutboxRepository repository, UUID commandId, UUID attemptId) {
+        UUID eventId = executionEventId(commandId, attemptId);
+        jdbc.update("UPDATE outbox_event SET available_at = TIMESTAMPTZ '2000-01-01 00:00:00Z' WHERE id = ?", eventId);
+        return transaction(() -> {
+            OutboxMessage leased = repository.claimDue().getFirst();
+            assertEquals(eventId, leased.id());
+            return leased;
+        });
+    }
+
+    private static PostgresOutboxRepository outboxRepository() {
+        return new PostgresOutboxRepository(
+                jdbc,
+                Clock.systemUTC(),
+                new OutboxProperties(
+                        1,
+                        Duration.ofSeconds(30),
+                        Duration.ofMillis(500),
+                        3,
+                        Duration.ofSeconds(5),
+                        Duration.ofMinutes(5),
+                        3),
+                (message, recoveryCount) -> {});
+    }
+
+    private static RetryReversalCommand retryRequest(UUID commandId, String key) {
+        return new RetryReversalCommand(
+                commandId,
+                "CONFIRMED_NOT_EXECUTED",
+                "Retry synthetic proven non-execution",
+                key,
+                new CorrelationId(UUID.randomUUID()));
+    }
+
+    private static void process(OutcomeObservation observation) {
+        transaction(() -> {
+            store.processOutcome(observation);
+            return null;
+        });
     }
 
     private static String sha256(String value) {

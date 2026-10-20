@@ -242,6 +242,27 @@ public final class ReversalCommand {
         return transitionTo(ReversalCommandState.EXECUTION_PENDING, null, at);
     }
 
+    /**
+     * Withdraws retry eligibility when a contradictory result invalidates matching terminal
+     * evidence, including non-execution established by an approved reconciliation. The original
+     * attempt evidence remains immutable; an already in-flight dispatch cannot be recalled.
+     */
+    public ReversalCommand requireReconciliationForConflictingOutcome(ExecutionAttempt attempt, Instant at) {
+        if (state != ReversalCommandState.RETRY_SCHEDULED
+                && state != ReversalCommandState.EXECUTION_PENDING
+                && state != ReversalCommandState.EXECUTING) {
+            throw new InvalidStateTransitionException(
+                    "ReversalCommand", state, "requireReconciliationForConflictingOutcome");
+        }
+        Objects.requireNonNull(attempt, "attempt must not be null");
+        requireMatchingAttempt(
+                attempt,
+                attempt.state() == ExecutionAttemptState.AMBIGUOUS
+                        ? ExecutionAttemptState.AMBIGUOUS
+                        : ExecutionAttemptState.CONFIRMED_NOT_EXECUTED);
+        return transitionTo(ReversalCommandState.RECONCILIATION_REQUIRED, "CONTRADICTORY_OUTCOME", at);
+    }
+
     /** Moves a command with an unknown execution result to reconciliation without retrying it. */
     public ReversalCommand requireReconciliation(ExecutionAttempt attempt, Instant at) {
         requireState(ReversalCommandState.EXECUTING, "requireReconciliation");

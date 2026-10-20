@@ -18,6 +18,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.amqp.AmqpException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -137,6 +138,84 @@ class RabbitOutboxPublisherTest {
         assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
     }
 
+    @Test
+    void suppressedExecutionDoesNotSendAndDoesNotStarveTheRemainingClaimedBatch() {
+        OutboxMessage suppressed = message("ReversalExecutionRequested.v1", "{}");
+        OutboxMessage lifecycle = message("ReversalAccepted.v1", "{}");
+        RecordingRepository repository = new RecordingRepository(suppressed);
+        repository.suppressExecution = true;
+        repository.additional = List.of(lifecycle);
+        RecordingTransactionManager manager = new RecordingTransactionManager();
+        RecordingRabbitTemplate rabbit = new RecordingRabbitTemplate();
+        RecordingAudit audit = new RecordingAudit();
+        MessagingProperties properties = messaging();
+        RabbitOutboxPublisher publisher = new RabbitOutboxPublisher(
+                new OutboxApplicationService(new SpringTransactionBoundary(manager), repository, audit),
+                rabbit,
+                new MessageIntegrity(properties),
+                properties,
+                outbox(),
+                new SimpleMeterRegistry(),
+                new RabbitTraceContext(Tracer.NOOP, Propagator.NOOP));
+
+        publisher.publishDue();
+
+        assertEquals(1, repository.preparationCalls);
+        assertEquals(suppressed, repository.suppressed);
+        assertEquals(1, rabbit.sendCalls);
+        assertEquals(
+                lifecycle.id().toString(), rabbit.sent.getMessageProperties().getMessageId());
+        assertEquals(lifecycle, repository.published);
+        assertEquals(lifecycle, audit.published);
+        assertEquals(1, manager.rollbacks);
+        assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+    }
+
+    @Test
+    void cancelledFinalAttemptFailureDoesNotStarveTheRemainingClaimedBatch() {
+        OutboxMessage initial = message("ReversalExecutionRequested.v1", "{}");
+        OutboxMessage finalAttempt = new OutboxMessage(
+                initial.id(),
+                initial.tenantId(),
+                initial.aggregateId(),
+                initial.eventType(),
+                initial.schemaVersion(),
+                initial.correlationId(),
+                initial.causationId(),
+                initial.payload(),
+                outbox().maxAttempts(),
+                initial.traceContext());
+        OutboxMessage lifecycle = message("ReversalAccepted.v1", "{}");
+        RecordingRepository repository = new RecordingRepository(finalAttempt);
+        repository.cancelledDuringPublication = true;
+        repository.additional = List.of(lifecycle);
+        RecordingTransactionManager manager = new RecordingTransactionManager();
+        RecordingRabbitTemplate rabbit = new RecordingRabbitTemplate();
+        rabbit.failExecution = true;
+        RecordingAudit audit = new RecordingAudit();
+        MessagingProperties properties = messaging();
+        RabbitOutboxPublisher publisher = new RabbitOutboxPublisher(
+                new OutboxApplicationService(new SpringTransactionBoundary(manager), repository, audit),
+                rabbit,
+                new MessageIntegrity(properties),
+                properties,
+                outbox(),
+                new SimpleMeterRegistry(),
+                new RabbitTraceContext(Tracer.NOOP, Propagator.NOOP));
+
+        publisher.publishDue();
+
+        assertEquals(1, repository.preparationCalls);
+        assertEquals(finalAttempt, repository.ignoredCancelledFailure);
+        assertEquals(2, rabbit.sendCalls);
+        assertEquals(lifecycle, repository.published);
+        assertEquals(lifecycle, audit.published);
+        assertEquals(
+                lifecycle.id().toString(), rabbit.sent.getMessageProperties().getMessageId());
+        assertEquals(0, manager.rollbacks);
+        assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+    }
+
     private static OutboxMessage message(String eventType, String payload) {
         UUID messageId = UUID.randomUUID();
         UUID correlationId = UUID.randomUUID();
@@ -192,6 +271,11 @@ class RabbitOutboxPublisherTest {
         private final OutboxMessage prepared;
         private int preparationCalls;
         private OutboxMessage published;
+        private OutboxMessage suppressed;
+        private boolean suppressExecution;
+        private boolean cancelledDuringPublication;
+        private OutboxMessage ignoredCancelledFailure;
+        private List<OutboxMessage> additional = List.of();
 
         private RecordingRepository(OutboxMessage claimed) {
             this(claimed, claimed);
@@ -212,13 +296,18 @@ class RabbitOutboxPublisherTest {
         @Override
         public List<OutboxMessage> claimDue() {
             assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
-            return List.of(claimed);
+            List<OutboxMessage> batch = new ArrayList<>(List.of(claimed));
+            batch.addAll(additional);
+            return List.copyOf(batch);
         }
 
         @Override
         public OutboxMessage prepareForPublish(OutboxMessage message) {
             assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
             preparationCalls++;
+            if (suppressExecution) {
+                throw new ExecutionPublicationSuppressedException();
+            }
             return prepared;
         }
 
@@ -230,6 +319,17 @@ class RabbitOutboxPublisherTest {
 
         @Override
         public void markFailed(OutboxMessage message, String errorCode, boolean retryable) {
+            if (cancelledDuringPublication && "BROKER_UNAVAILABLE".equals(errorCode) && retryable) {
+                assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
+                assertEquals(outbox().maxAttempts(), message.attemptCount());
+                ignoredCancelledFailure = message;
+                return;
+            }
+            if (suppressExecution && "EXECUTION_SUPPRESSED".equals(errorCode) && !retryable) {
+                assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
+                suppressed = message;
+                return;
+            }
             throw new AssertionError("Unexpected publication failure: " + errorCode);
         }
     }
@@ -242,6 +342,7 @@ class RabbitOutboxPublisherTest {
     private static final class RecordingRabbitTemplate extends RabbitTemplate {
         private int sendCalls;
         private Message sent;
+        private boolean failExecution;
 
         @Override
         public void send(String exchange, String routingKey, Message message, CorrelationData correlationData) {
@@ -250,6 +351,11 @@ class RabbitOutboxPublisherTest {
                     "Rabbit send/confirmation must execute outside every database transaction");
             sendCalls++;
             sent = message;
+            if (failExecution
+                    && "ReversalExecutionRequested.v1"
+                            .equals(message.getMessageProperties().getType())) {
+                throw new AmqpException("synthetic failure after concurrent cancellation");
+            }
             correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
         }
     }

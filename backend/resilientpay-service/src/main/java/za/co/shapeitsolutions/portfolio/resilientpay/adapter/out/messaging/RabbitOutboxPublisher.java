@@ -89,7 +89,15 @@ public final class RabbitOutboxPublisher {
         // Only execution requests carry a dispatch-relative deadline. Avoid opening an otherwise
         // empty database transaction for the four lifecycle events produced by each happy path.
         if (EXECUTION_EVENT.equals(outbox.eventType())) {
-            outbox = operations.prepareForPublish(outbox);
+            try {
+                outbox = operations.prepareForPublish(outbox);
+            } catch (ExecutionPublicationSuppressedException exception) {
+                operations.markFailed(outbox, "EXECUTION_SUPPRESSED", false);
+                meterRegistry
+                        .counter("resilientpay.outbox.publish", "outcome", "suppressed")
+                        .increment();
+                return;
+            }
         }
         if ((!EXECUTION_EVENT.equals(outbox.eventType())
                         && !ACCEPTED_EVENT.equals(outbox.eventType())

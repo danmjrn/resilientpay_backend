@@ -942,7 +942,40 @@ public class PostgresOrchestrationStore
                         observation.correlationId(),
                         observation.payloadHash(),
                         "CONTRADICTORY_OUTCOME");
-                outcomeAudit(observation, current, "CONTRADICTORY_SWITCH_OUTCOME", "FAILED", clock.instant());
+                Instant conflictAt = latest(observation.observedAt(), current.updatedAt(), clock.instant());
+                ReversalCommand conflicted = current;
+                if (current.state() == ReversalCommandState.RETRY_SCHEDULED
+                        || current.state() == ReversalCommandState.EXECUTION_PENDING
+                        || current.state() == ReversalCommandState.EXECUTING) {
+                    conflicted = current.requireReconciliationForConflictingOutcome(attempt, conflictAt);
+                    Integer existingCases = jdbc.queryForObject(
+                            """
+                            SELECT COUNT(*) FROM reconciliation_case
+                            WHERE tenant_id = ? AND reversal_command_id = ?
+                            """,
+                            Integer.class,
+                            observation.tenantId().value(),
+                            current.id().value());
+                    if (Objects.requireNonNull(existingCases) > 0) {
+                        conflicted = conflicted.quarantine("CONTRADICTORY_OUTCOME", conflictAt);
+                    } else {
+                        insertCase(ReconciliationCase.open(
+                                new ReconciliationCaseId(UUID.randomUUID()),
+                                conflicted,
+                                "CONTRADICTORY_OUTCOME",
+                                conflictAt));
+                        metrics.reconciliationOpened("contradictory-outcome");
+                    }
+                    updateReversal(current, conflicted, null);
+                    update("""
+                            UPDATE outbox_event
+                            SET status = 'DEAD', retryable = FALSE, lease_owner = NULL, lease_until = NULL,
+                                last_error_code = 'CONTRADICTORY_OUTCOME'
+                            WHERE tenant_id = ? AND aggregate_id = ?
+                              AND event_type = 'ReversalExecutionRequested.v1' AND status <> 'PUBLISHED'
+                            """, observation.tenantId().value(), current.id().value());
+                }
+                outcomeAudit(observation, conflicted, "CONTRADICTORY_SWITCH_OUTCOME", "FAILED", conflictAt);
                 metrics.outcomeProcessed("contradictory");
                 return;
             }
@@ -984,13 +1017,28 @@ public class PostgresOrchestrationStore
             }
             case "CONFIRMED_NOT_EXECUTED" -> {
                 ExecutionAttempt safeAttempt = dispatched.confirmNotExecuted(reason, transitionAt);
-                ReversalCommand retryScheduled =
-                        executing.scheduleSafeRetry(NonExecutionEvidence.from(safeAttempt), transitionAt);
-                Instant nextAttemptAt =
-                        transitionAt.plus(executing.retryPolicySnapshot().initialBackoff());
                 updateAttempt(attempt, safeAttempt, "CONFIRMED_NOT_EXECUTED");
-                updateReversal(current, retryScheduled, nextAttemptAt);
-                outcomeAudit(observation, retryScheduled, "SWITCH_CONFIRMED_NOT_EXECUTED", "FAILED", transitionAt);
+                if (executing.retryPolicySnapshot().permitsAttemptAfter(safeAttempt.attemptNumber())) {
+                    ReversalCommand retryScheduled =
+                            executing.scheduleSafeRetry(NonExecutionEvidence.from(safeAttempt), transitionAt);
+                    Instant nextAttemptAt =
+                            transitionAt.plus(executing.retryPolicySnapshot().initialBackoff());
+                    updateReversal(current, retryScheduled, nextAttemptAt);
+                    outcomeAudit(observation, retryScheduled, "SWITCH_CONFIRMED_NOT_EXECUTED", "FAILED", transitionAt);
+                } else {
+                    ReversalCommand exhausted = executing.rejectAfterNonExecution(
+                            NonExecutionEvidence.from(safeAttempt), "ATTEMPT_LIMIT_EXCEEDED", transitionAt);
+                    OriginalTransaction released = original.releaseReservation(transitionAt);
+                    updateReversal(current, exhausted, null);
+                    updateOriginal(original, released);
+                    releaseReservation(observation.tenantId(), original.id().value(), transitionAt);
+                    insertOriginalStatusOutbox(
+                            released,
+                            exhausted.correlationId().value(),
+                            exhausted.id().value(),
+                            transitionAt);
+                    outcomeAudit(observation, exhausted, "SWITCH_RETRY_EXHAUSTED", "REJECTED", transitionAt);
+                }
             }
             case "REJECTED" -> {
                 ExecutionAttempt rejectedAttempt = dispatched.confirmNotExecuted(reason, transitionAt);
@@ -1052,12 +1100,25 @@ public class PostgresOrchestrationStore
                         FROM execution_attempt
                         WHERE tenant_id = ? AND reversal_command_id = ?
                         """, Integer.class, tenantId.value(), current.id().value());
-                ReversalCommand retryScheduled = current.scheduleRetryFromReconciliation(
-                        Objects.requireNonNull(completedAttemptNumber), "RECONCILIATION_CONFIRMED_NOT_EXECUTED", at);
-                updateReversal(
-                        current,
-                        retryScheduled,
-                        at.plus(current.retryPolicySnapshot().initialBackoff()));
+                if (current.retryPolicySnapshot().permitsAttemptAfter(Objects.requireNonNull(completedAttemptNumber))) {
+                    ReversalCommand retryScheduled = current.scheduleRetryFromReconciliation(
+                            completedAttemptNumber, "RECONCILIATION_CONFIRMED_NOT_EXECUTED", at);
+                    updateReversal(
+                            current,
+                            retryScheduled,
+                            at.plus(current.retryPolicySnapshot().initialBackoff()));
+                } else {
+                    ReversalCommand exhausted = current.rejectFromReconciliation("ATTEMPT_LIMIT_EXCEEDED", at);
+                    OriginalTransaction released = original.releaseReservation(at);
+                    updateReversal(current, exhausted, null);
+                    updateOriginal(original, released);
+                    releaseReservation(tenantId, original.id().value(), at);
+                    insertOriginalStatusOutbox(
+                            released,
+                            exhausted.correlationId().value(),
+                            exhausted.id().value(),
+                            at);
+                }
             }
             case REJECT_REVERSAL -> {
                 ReversalCommand rejected = current.rejectFromReconciliation(decision.name(), at);
