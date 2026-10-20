@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+  <suppress until="2026-11-19Z">
+    <notes><![CDATA[
+SEC-EX-001; owner Daniel Jr Nkulu; approved 2026-10-20.
+Only CVE-2026-71290 in docker-java-transport-zerodep 3.7.1's shaded
+HttpClient 5.5.1, used by Testcontainers in test scope. The reviewed
+transport uses the classic client; the vendor excludes that client.
+The vulnerable-version bytes remain present. This is not a patch.
+Evidence: docs/evidence/dependency-security-review-2026-10-20.md
+The Maven verify hook independently enforces exact outer/child hashes,
+coordinates, test scope, this single finding, and expiry at
+2026-11-19T00:00:00Z. Remove/review when a fixed transport is released,
+the dependency/call path changes, or the exception expires.
+    ]]></notes>
+    <filePath regex="true" caseSensitive="true">^.*[\\/]com[\\/]github[\\/]docker-java[\\/]docker-java-transport-zerodep[\\/]3\.7\.1[\\/]docker-java-transport-zerodep-3\.7\.1\.jar[\\/]META-INF[\\/]maven[\\/]org\.apache\.httpcomponents\.client5[\\/]httpclient5[\\/]pom\.xml$</filePath>
+    <cve>CVE-2026-71290</cve>
+  </suppress>
+</suppressions>

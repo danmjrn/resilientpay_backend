@@ -39,8 +39,10 @@
     <compiler-plugin.version>3.15.0</compiler-plugin.version>
     <cyclonedx-plugin.version>2.9.3</cyclonedx-plugin.version>
     <enforcer-plugin.version>3.6.3</enforcer-plugin.version>
+    <exec-plugin.version>3.6.4</exec-plugin.version>
     <failsafe-plugin.version>3.5.6</failsafe-plugin.version>
     <skipITs>true</skipITs>
+    <security.python>python3</security.python>
     <jacoco-plugin.version>0.8.15</jacoco-plugin.version>
     <javadoc-plugin.version>3.12.0</javadoc-plugin.version>
     <site-plugin.version>3.21.0</site-plugin.version>
@@ -269,6 +271,7 @@
             <configuration>
               <outputFormat>json</outputFormat>
               <schemaVersion>1.6</schemaVersion>
+              <includeTestScope>true</includeTestScope>
             </configuration>
           </execution>
         </executions>
@@ -300,7 +303,12 @@
             <configuration>
               <nvdDatafeedUrl>https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache/nvdcve-{0}.json.gz</nvdDatafeedUrl>
               <failOnError>true</failOnError>
+              <skipTestScope>false</skipTestScope>
               <failBuildOnCVSS>9</failBuildOnCVSS>
+              <failBuildOnUnusedSuppressionRule>true</failBuildOnUnusedSuppressionRule>
+              <suppressionFiles>
+                <suppressionFile>${project.basedir}/dependency-check-suppressions.xml</suppressionFile>
+              </suppressionFiles>
               <formats>
                 <format>HTML</format>
                 <format>JSON</format>
@@ -313,6 +321,30 @@
                   <goal>aggregate</goal>
                 </goals>
                 <phase>verify</phase>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <version>${exec-plugin.version}</version>
+            <inherited>false</inherited>
+            <executions>
+              <execution>
+                <id>enforce-approved-dependency-exception</id>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <phase>verify</phase>
+                <configuration>
+                  <executable>${security.python}</executable>
+                  <workingDirectory>${project.basedir}/..</workingDirectory>
+                  <timeout>120000</timeout>
+                  <arguments>
+                    <argument>${project.basedir}/../scripts/validate_dependency_exception.py</argument>
+                    <argument>${project.basedir}/..</argument>
+                  </arguments>
+                </configuration>
               </execution>
             </executions>
           </plugin>
