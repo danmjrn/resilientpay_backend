@@ -1,0 +1,31 @@
+title = "ResilientPay backend: default detection with exact routing-name exceptions"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Public AMQP routing identifier, not credential material"
+condition = "AND"
+paths = ['''^backend/synthetic-switch-simulator/src/main/java/za/co/shapeitsolutions/portfolio/resilientpay/simulator/RabbitTopology\.java$''']
+regexTarget = "line"
+regexes = ['''^\s*public static final String OUTCOME_ROUTING_KEY = "reversal\.outcome\.observed\.v1";\s*$''']
+
+[[rules.allowlists]]
+description = "Exact public routing identifiers in runtime configuration"
+condition = "AND"
+paths = ['''^backend/resilientpay-service/src/main/resources/application\.yml$''']
+regexTarget = "line"
+regexes = [
+  '''^\s*outcome-routing-key: reversal\.outcome\.observed\.v1\s*$''',
+  '''^\s*execution-quarantine-routing-key: reversal\.execution\.quarantined\.v1\s*$''',
+]
+
+[[rules.allowlists]]
+description = "Fixed synthetic transaction identifier in the rollback integration test"
+condition = "AND"
+paths = ['''^backend/resilientpay-service/src/test/java/za/co/shapeitsolutions/portfolio/resilientpay/adapter/out/persistence/PostgresOrchestrationStoreIT\.java$''']
+regexTarget = "line"
+regexes = ['''^\s*String token = "synth-application-denial-0001";\s*$''']
