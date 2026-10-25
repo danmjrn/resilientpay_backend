@@ -32,8 +32,11 @@
     <checkstyle.config.location>${project.basedir}/config/checkstyle/checkstyle.xml</checkstyle.config.location>
     <checkstyle.version>13.10.0</checkstyle.version>
     <dependency-check.version>13.0.0</dependency-check.version>
+    <jackson-2-bom.version>2.21.8</jackson-2-bom.version>
+    <jackson-bom.version>3.1.8</jackson-bom.version>
     <json-schema-validator.version>3.0.6</json-schema-validator.version>
     <palantir-java-format.version>2.97.0</palantir-java-format.version>
+    <rabbit-amqp-client.version>5.36.0</rabbit-amqp-client.version>
     <springdoc.version>3.1.0</springdoc.version>
     <tomcat.version>11.0.25</tomcat.version>
     <compiler-plugin.version>3.15.0</compiler-plugin.version>
