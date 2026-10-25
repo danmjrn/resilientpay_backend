@@ -22,7 +22,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
- * Proves every supported historical database state migrates to V5 and that V3 writers fail closed.
+ * Proves every supported historical database state migrates to V6 and that V3 writers fail closed.
  *
  * @author Daniel Jr Nkulu
  */
@@ -43,31 +43,36 @@ class MigrationCompatibilityIT {
     private static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:18.4-alpine");
 
     @Test
-    void emptyDatabaseMigratesToV5() {
-        assertMigratesToV5(0);
+    void emptyDatabaseMigratesToV6() {
+        assertMigratesToV6(0);
     }
 
     @Test
-    void v1DatabaseMigratesToV5() {
-        assertMigratesToV5(1);
+    void v1DatabaseMigratesToV6() {
+        assertMigratesToV6(1);
     }
 
     @Test
-    void v2DatabaseMigratesToV5() {
-        assertMigratesToV5(2);
+    void v2DatabaseMigratesToV6() {
+        assertMigratesToV6(2);
     }
 
     @Test
-    void v3DatabaseMigratesToV5() {
-        assertMigratesToV5(3);
+    void v3DatabaseMigratesToV6() {
+        assertMigratesToV6(3);
     }
 
     @Test
-    void v4DatabaseMigratesToV5() {
-        assertMigratesToV5(4);
+    void v4DatabaseMigratesToV6() {
+        assertMigratesToV6(4);
     }
 
-    private void assertMigratesToV5(int startingVersion) {
+    @Test
+    void v5DatabaseMigratesToV6() {
+        assertMigratesToV6(5);
+    }
+
+    private void assertMigratesToV6(int startingVersion) {
         String schema = "migration_from_v" + startingVersion;
         JdbcTemplate jdbc = databaseInFreshSchema(schema);
         if (startingVersion > 0) {
@@ -80,7 +85,7 @@ class MigrationCompatibilityIT {
         current.migrate();
         current.validate();
 
-        assertEquals(List.of("1", "2", "3", "4", "5"), successfulVersions(jdbc));
+        assertEquals(List.of("1", "2", "3", "4", "5", "6"), successfulVersions(jdbc));
         assertEquals(0, current.migrate().migrationsExecuted);
         assertTrue(hasTimelineIndex(jdbc));
         assertEquals(startingVersion == 0 ? 0 : 1, commandCount(jdbc));
@@ -88,12 +93,12 @@ class MigrationCompatibilityIT {
             assertBackfilledCommand(jdbc);
         }
         if (startingVersion == 4) {
-            assertEquals(v4Row, commandJson(jdbc), "V5 must not mutate V4 command data");
+            assertEquals(v4Row, commandJson(jdbc), "V6 must not mutate V4 command data");
         }
     }
 
     @Test
-    void v3ShapedWriterFailsClosedAgainstV5WithoutChangingRowCount() {
+    void v3ShapedWriterFailsClosedAgainstV6WithoutChangingRowCount() {
         String schema = "migration_v3_writer_boundary";
         JdbcTemplate jdbc = databaseInFreshSchema(schema);
         Flyway current = flyway(schema, null);

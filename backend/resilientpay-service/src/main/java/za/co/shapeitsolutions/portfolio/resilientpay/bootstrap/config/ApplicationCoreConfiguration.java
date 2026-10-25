@@ -41,7 +41,7 @@ public class ApplicationCoreConfiguration {
     @Bean
     @Profile("!test")
     RuntimeMode runtimeMode(Environment environment) {
-        return new RuntimeMode(environment.acceptsProfiles(Profiles.of("demo", "test")));
+        return new RuntimeMode(environment.acceptsProfiles(Profiles.of("demo", "test", "portfolio")));
     }
 
     /** Adapts application-selected database scopes to the deployment transaction manager. */

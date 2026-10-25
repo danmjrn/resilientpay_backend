@@ -361,7 +361,46 @@ class ReversalApplicationServiceTest {
         return (OrchestrationStore) Proxy.newProxyInstance(
                 OrchestrationStore.class.getClassLoader(),
                 new Class<?>[] {OrchestrationStore.class},
-                (proxy, method, arguments) -> invocation.invoke(method.getName(), arguments));
+                (proxy, method, arguments) -> {
+                    Object result = invocation.invoke(method.getName(), arguments);
+                    return result == null ? validResponse(method.getName()) : result;
+                });
+    }
+
+    private static Object validResponse(String method) {
+        var view = new za.co.shapeitsolutions.portfolio.resilientpay.application.model.ReversalView(
+                UUID.randomUUID(),
+                "synth-application-fixture-0001",
+                za.co.shapeitsolutions.portfolio.resilientpay.domain.shared.OperationType.CARD_PURCHASE,
+                java.math.BigDecimal.ONE,
+                "ZAR",
+                za.co.shapeitsolutions.portfolio.resilientpay.domain.reversal.ReversalCommandState.COMPLETED,
+                null,
+                UUID.randomUUID(),
+                1,
+                java.time.Instant.EPOCH,
+                java.time.Instant.EPOCH,
+                1,
+                List.of("VIEW"));
+        return switch (method) {
+            case "accept" ->
+                new za.co.shapeitsolutions.portfolio.resilientpay.application.model.AcceptanceResult(view, false);
+            case "retry", "getReversal" -> view;
+            case "propose", "approve" ->
+                new za.co.shapeitsolutions.portfolio.resilientpay.application.model.ReconciliationCaseView(
+                        UUID.randomUUID(),
+                        view.id(),
+                        za.co.shapeitsolutions.portfolio.resilientpay.domain.reconciliation.ReconciliationCaseState
+                                .RESOLVED,
+                        "SYNTHETIC_AMBIGUITY",
+                        "CONFIRM_EXECUTED",
+                        "synthetic-maker",
+                        "Synthetic fixture purpose",
+                        "a".repeat(64),
+                        java.time.Instant.EPOCH,
+                        java.time.Instant.EPOCH);
+            default -> null;
+        };
     }
 
     private static SecurityAuditPort noOpAudit() {

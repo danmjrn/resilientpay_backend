@@ -63,7 +63,8 @@ public final class ReversalApplicationService implements ReversalOperations {
                 actor.tenantId().value(),
                 correlation(actor, command));
         mutationAdmission.requirePermit(actor.tenantId(), "accept-reversal");
-        return transactions.required(() -> store.accept(actor, command));
+        AcceptanceResult result = transactions.required(() -> store.accept(actor, command));
+        return new AcceptanceResult(result.command().authorizedFor(actor), result.replayed());
     }
 
     @Override
@@ -74,13 +75,17 @@ public final class ReversalApplicationService implements ReversalOperations {
                 "LIST_REVERSALS",
                 actor.tenantId().value(),
                 actor.tenantId().value());
-        return transactions.readOnly(() -> store.listReversals(actor.tenantId(), status, limit));
+        return transactions.readOnly(() -> store.listReversals(actor.tenantId(), status, limit)).stream()
+                .map(view -> view.authorizedFor(actor))
+                .toList();
     }
 
     @Override
     public ReversalView getReversal(ActorContext actor, UUID commandId) {
         authorize(actor, "SCOPE_reversals.read", "READ_REVERSAL", commandId, commandId);
-        return transactions.readOnly(() -> store.getReversal(actor.tenantId(), commandId));
+        return transactions
+                .readOnly(() -> store.getReversal(actor.tenantId(), commandId))
+                .authorizedFor(actor);
     }
 
     @Override
@@ -90,7 +95,7 @@ public final class ReversalApplicationService implements ReversalOperations {
                 command == null ? resourceId : command.correlationId().value();
         authorize(actor, "SCOPE_reversals.retry", "RETRY_REVERSAL", resourceId, correlationId);
         mutationAdmission.requirePermit(actor.tenantId(), "retry-reversal");
-        return transactions.required(() -> store.retry(actor, command));
+        return transactions.required(() -> store.retry(actor, command)).authorizedFor(actor);
     }
 
     @Override
@@ -143,7 +148,9 @@ public final class ReversalApplicationService implements ReversalOperations {
                 "LIST_RECONCILIATION_CASES",
                 actor.tenantId().value(),
                 actor.tenantId().value());
-        return transactions.readOnly(() -> store.listReconciliationCases(actor.tenantId()));
+        return transactions.readOnly(() -> store.listReconciliationCases(actor.tenantId())).stream()
+                .map(view -> view.authorizedFor(actor, requiredApprovalAssurance))
+                .toList();
     }
 
     @Override
@@ -153,7 +160,9 @@ public final class ReversalApplicationService implements ReversalOperations {
                 command == null ? resourceId : command.correlationId().value();
         authorize(actor, "SCOPE_reconciliation.decide", "PROPOSE_RECONCILIATION", resourceId, correlationId);
         mutationAdmission.requirePermit(actor.tenantId(), "propose-reconciliation");
-        return transactions.required(() -> store.propose(actor, command));
+        return transactions
+                .required(() -> store.propose(actor, command))
+                .authorizedFor(actor, requiredApprovalAssurance);
     }
 
     @Override
@@ -164,7 +173,9 @@ public final class ReversalApplicationService implements ReversalOperations {
         authorize(actor, "SCOPE_reconciliation.approve", "APPROVE_RECONCILIATION", resourceId, correlationId);
         requireApprovalAssurance(actor, resourceId, correlationId);
         mutationAdmission.requirePermit(actor.tenantId(), "approve-reconciliation");
-        return transactions.required(() -> store.approve(actor, command));
+        return transactions
+                .required(() -> store.approve(actor, command))
+                .authorizedFor(actor, requiredApprovalAssurance);
     }
 
     private void authorize(ActorContext actor, String authority, String action, UUID resourceId, UUID correlationId) {

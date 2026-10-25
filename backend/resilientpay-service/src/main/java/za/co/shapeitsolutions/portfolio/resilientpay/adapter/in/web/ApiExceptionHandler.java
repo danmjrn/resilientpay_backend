@@ -38,6 +38,20 @@ import za.co.shapeitsolutions.portfolio.resilientpay.domain.shared.DomainExcepti
 public final class ApiExceptionHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger(ApiExceptionHandler.class);
 
+    /** Keeps absent profile-gated endpoints absent instead of turning MVC's 404 into a server error. */
+    @ExceptionHandler({
+        org.springframework.web.servlet.NoHandlerFoundException.class,
+        org.springframework.web.servlet.resource.NoResourceFoundException.class
+    })
+    ResponseEntity<ProblemResponse> absentResource(Exception exception, HttpServletRequest request) {
+        return problem(
+                ApplicationErrorCode.RESOURCE_NOT_FOUND,
+                HttpStatus.NOT_FOUND,
+                "The requested resource was not found",
+                request,
+                null);
+    }
+
     /** Maps stable application errors without exposing tenant or infrastructure internals. */
     @ExceptionHandler(ApplicationException.class)
     ResponseEntity<ProblemResponse> application(ApplicationException exception, HttpServletRequest request) {

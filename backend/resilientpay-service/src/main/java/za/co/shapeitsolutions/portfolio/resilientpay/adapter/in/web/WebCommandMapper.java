@@ -30,7 +30,7 @@ public final class WebCommandMapper {
 
     /** Creates the mapper with fail-closed awareness of explicit local profiles. */
     public WebCommandMapper(Environment environment) {
-        demonstrationFailuresEnabled = environment.acceptsProfiles(Profiles.of("demo", "test"));
+        demonstrationFailuresEnabled = environment.acceptsProfiles(Profiles.of("demo", "test", "portfolio"));
     }
 
     /** Maps one full reversal acceptance request. */

@@ -52,4 +52,30 @@ public record ReversalView(
         Objects.requireNonNull(updatedAt);
         allowedActions = List.copyOf(Objects.requireNonNull(allowedActions));
     }
+
+    /** Projects state-derived actions through the authenticated caller's scopes. */
+    public ReversalView authorizedFor(ActorContext actor) {
+        List<String> actions = allowedActions.stream()
+                .filter(action -> switch (action) {
+                    case "VIEW_EVIDENCE" -> actor.authorities().contains("SCOPE_audit.read");
+                    case "REQUEST_SAFE_RETRY" -> actor.authorities().contains("SCOPE_reversals.retry");
+                    case "VIEW", "CHECK_OUTCOME" -> actor.authorities().contains("SCOPE_reversals.read");
+                    default -> false;
+                })
+                .toList();
+        return new ReversalView(
+                id,
+                originalTransactionToken,
+                operationType,
+                amount,
+                currency,
+                status,
+                statusReasonCode,
+                correlationId,
+                attemptCount,
+                createdAt,
+                updatedAt,
+                version,
+                actions);
+    }
 }

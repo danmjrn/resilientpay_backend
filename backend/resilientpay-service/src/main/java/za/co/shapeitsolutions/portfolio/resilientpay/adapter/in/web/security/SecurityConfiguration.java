@@ -1,6 +1,7 @@
 package za.co.shapeitsolutions.portfolio.resilientpay.adapter.in.web.security;
 
 import java.util.List;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -17,6 +18,7 @@ import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtValidators;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
+import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.util.matcher.RequestMatcher;
 import org.springframework.web.cors.CorsConfiguration;
@@ -42,7 +44,8 @@ public class SecurityConfiguration {
             JwtAuthenticationConverter jwtAuthenticationConverter,
             ApiAuthenticationEntryPoint authenticationEntryPoint,
             ApiAccessDeniedHandler accessDeniedHandler,
-            Environment environment)
+            Environment environment,
+            ObjectProvider<PortfolioRequestSecurity> portfolioSecurity)
             throws Exception {
         http.csrf(csrf -> csrf.disable())
                 .cors(cors -> {})
@@ -54,6 +57,8 @@ public class SecurityConfiguration {
                                 "/actuator/info",
                                 "/api/openapi/" + "**",
                                 "/api/swagger-ui/" + "**",
+                                "/api/v1/portfolio/session",
+                                "/api/v1/portfolio/session/" + "**",
                                 "/api/v1/demo/token")
                         .permitAll()
                         .requestMatchers(publicMetricsMatcher(environment))
@@ -67,6 +72,10 @@ public class SecurityConfiguration {
                 .exceptionHandling(exceptions -> exceptions
                         .authenticationEntryPoint(authenticationEntryPoint)
                         .accessDeniedHandler(accessDeniedHandler));
+        PortfolioRequestSecurity portfolio = portfolioSecurity.getIfAvailable();
+        if (portfolio != null) {
+            http.addFilterAfter(new PortfolioSessionBindingFilter(portfolio), BearerTokenAuthenticationFilter.class);
+        }
         return http.build();
     }
 
@@ -80,7 +89,7 @@ public class SecurityConfiguration {
 
     /** Validates the configured production issuer, timestamps, and API audience. */
     @Bean
-    @Profile("!demo & !test")
+    @Profile("!demo & !test & !portfolio")
     JwtDecoder oidcJwtDecoder(
             @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}") String issuer,
             @Value("${spring.security.oauth2.resourceserver.jwt.jwk-set-uri}") String jwkSetUri,
@@ -96,7 +105,7 @@ public class SecurityConfiguration {
     }
 
     static RequestMatcher publicMetricsMatcher(Environment environment) {
-        boolean localDemo = environment.acceptsProfiles(Profiles.of("demo"));
+        boolean localDemo = environment.acceptsProfiles(Profiles.of("demo", "portfolio"));
         return request -> localDemo && "/actuator/prometheus".equals(request.getRequestURI());
     }
 

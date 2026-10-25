@@ -473,6 +473,12 @@ components:
           description: SHA-256 digest of tenant- and case-owned evidence; never raw evidence.
         openedAt: { type: string, format: date-time }
         resolvedAt: { type: [string, 'null'], format: date-time }
+        allowedActions:
+          type: array
+          uniqueItems: true
+          readOnly: true
+          items: { type: string, enum: [VIEW, PROPOSE_DECISION, APPROVE_DECISION, VIEW_EVIDENCE] }
+          description: State-, scope- and assurance-filtered caller capabilities; mutations recheck all invariants.
     ReconciliationDecisionRequest:
       type: object
       additionalProperties: false

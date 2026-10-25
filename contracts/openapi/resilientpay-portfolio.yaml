@@ -1,0 +1,121 @@
+openapi: 3.1.0
+info:
+  title: ResilientPay isolated portfolio visitor sessions
+  version: 0.2.0
+  description: >-
+    Explicit portfolio profile only. Shared-password visitors receive an isolated synthetic
+    workspace and may demonstrate four bounded personas. Persona switching demonstrates
+    controls; it is not independent human approval or real MFA. Business operations remain
+    defined in resilientpay-v1.yaml and require bearer plus both matching browser cookies.
+    No caller-selected tenant, scope, assurance or subject is accepted. Every mutation
+    requires the exact configured HTTPS Origin. Cookies and tokens never belong in logs.
+servers:
+  - url: https://resilientpay.shapeit.solutions
+security:
+  - passwordAccess: []
+    workspace: []
+paths:
+  /api/v1/portfolio/session:
+    get:
+      operationId: getPortfolioSession
+      summary: Read active browser workspace metadata
+      responses:
+        '200': { $ref: '#/components/responses/Session' }
+        '401': { description: Missing, expired, revoked or mismatched session }
+        '503': { description: Session verification dependency unavailable }
+    post:
+      operationId: createPortfolioSession
+      summary: Create an isolated seeded workspace, or return this browser's active workspace
+      security:
+        - passwordAccess: []
+      description: >-
+        Empty body or empty JSON object only. Sets an opaque Secure/HttpOnly/SameSite=Strict
+        host-only workspace cookie. At most two hours, capped by password-session expiry.
+        Capacity is deliberately bounded; operator retention is required after lifetime quotas.
+      responses:
+        '200': { $ref: '#/components/responses/Session' }
+        '201': { $ref: '#/components/responses/Session' }
+        '400': { description: Caller-selected identity or nonempty creation body rejected }
+        '401': { description: Valid shared-password session required }
+        '403': { description: Exact configured Origin required }
+        '429': { description: Session or retained-data quota reached }
+  /api/v1/portfolio/session/persona:
+    post:
+      operationId: selectPortfolioPersona
+      summary: Issue one bounded persona token for this active workspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [role]
+              properties:
+                role: { $ref: '#/components/schemas/Role' }
+      responses:
+        '200':
+          description: Independently signed ten-minute token, capped by absolute workspace expiry
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [accessToken]
+                properties:
+                  accessToken: { type: string, readOnly: true }
+        '400': { description: Unknown persona or caller-defined privilege rejected }
+        '401': { description: Active matching browser workspace required }
+        '403': { description: Exact configured Origin required }
+  /api/v1/portfolio/session/reset:
+    post:
+      operationId: resetPortfolioWorkspace
+      summary: Revoke current workspace and atomically provision fresh synthetic tenant data
+      description: >-
+        Preserves old audit, idempotency, reservations and in-flight work. Does not extend the
+        original absolute session deadline. Old tokens fail after rotation even if signed.
+      responses:
+        '201': { $ref: '#/components/responses/Session' }
+        '401': { description: Active matching browser workspace required }
+        '403': { description: Exact configured Origin required }
+        '429': { description: Reset, session or retained-data quota reached; old workspace stays active }
+  /api/v1/portfolio/session/logout:
+    post:
+      operationId: logoutPortfolioWorkspace
+      summary: Revoke only this workspace and clear its browser credential
+      responses:
+        '204': { description: Workspace revoked and cookie expired; retained work is preserved }
+        '401': { description: Active matching browser workspace required }
+        '403': { description: Exact configured Origin required }
+components:
+  securitySchemes:
+    passwordAccess:
+      type: apiKey
+      in: cookie
+      name: __Host-resilientpay_access
+    workspace:
+      type: apiKey
+      in: cookie
+      name: __Host-resilientpay_workspace
+  schemas:
+    Role:
+      type: string
+      enum: [REVERSAL_OPERATOR, RECONCILIATION_MAKER, RECONCILIATION_CHECKER, AUDITOR]
+    Session:
+      type: object
+      additionalProperties: false
+      required: [sessionId, expiresAt, roles, state]
+      properties:
+        sessionId: { type: string, format: uuid }
+        expiresAt: { type: string, format: date-time }
+        roles:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Role' }
+        state: { type: string, const: ACTIVE }
+  responses:
+    Session:
+      description: Active safe workspace metadata; all responses are Cache-Control no-store
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Session' }

@@ -1,0 +1,9 @@
+spring:
+  flyway:
+    enabled: false
+    locations: classpath:db/migration
+resilientpay:
+  portfolio:
+    origin: ${RESILIENTPAY_PORTFOLIO_ORIGIN}
+    access-cookie-key: ${RESILIENTPAY_PORTFOLIO_ACCESS_COOKIE_KEY}
+    jwt-key: ${RESILIENTPAY_PORTFOLIO_JWT_KEY}

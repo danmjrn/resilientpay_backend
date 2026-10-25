@@ -23,6 +23,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import org.springframework.context.annotation.Profile;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcOperations;
@@ -1703,7 +1704,20 @@ public class PostgresOrchestrationStore
     }
 
     private int update(String sql, Object... arguments) {
-        return jdbc.update(sql, sqlArguments(arguments));
+        try {
+            return jdbc.update(sql, sqlArguments(arguments));
+        } catch (DataAccessException exception) {
+            if (exception.getMostSpecificCause() instanceof SQLException database
+                    && "P0001".equals(database.getSQLState())) {
+                if (database.getMessage().contains("PORTFOLIO_QUOTA_EXCEEDED")) {
+                    throw failure(ApplicationErrorCode.RATE_LIMITED, "The bounded portfolio data capacity was reached");
+                }
+                if (database.getMessage().contains("PORTFOLIO_SESSION_INACTIVE")) {
+                    throw failure(ApplicationErrorCode.AUTHENTICATION_REQUIRED, "The portfolio workspace is inactive");
+                }
+            }
+            throw exception;
+        }
     }
 
     private static Object[] sqlArguments(Object... arguments) {

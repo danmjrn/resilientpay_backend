@@ -22,6 +22,10 @@ public class ResilientPayApplication {
      * @param arguments command-line configuration arguments
      */
     public static void main(String[] arguments) {
+        if (java.util.Arrays.asList(arguments).contains("--portfolio-migrate")) {
+            System.exit(PortfolioMigrationCli.run(arguments, System.getenv(), System.out, System.err));
+            return;
+        }
         SpringApplication.run(ResilientPayApplication.class, arguments);
     }
 }

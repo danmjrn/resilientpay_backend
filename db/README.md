@@ -9,7 +9,9 @@ The executable Flyway inventory is mirrored here byte for byte:
 3. `migration/V3__runtime_adapter_integrity.sql`
 4. `migration/V4__bounded_outbox_cold_recovery.sql`
 5. `migration/V5__bounded_reversal_timeline_query.sql`
-6. `devseed/R__synthetic_demo_seed.sql` — repeatable, opt-in demo seed containing only neutral synthetic tokens
+6. `migration/V6__isolated_portfolio_workspaces.sql` — additive isolated visitor workspaces and quotas
+7. `migration/afterMigrate.sql` — fixed production runtime grants after owner-only migration
+8. `devseed/R__synthetic_demo_seed.sql` — repeatable, opt-in demo seed containing only neutral synthetic tokens
 
 The application resources under `backend/resilientpay-service/src/main/resources/db` are the files Flyway executes. This directory is the review-facing mirror. Repository validation rejects a missing, extra, renamed or byte-different SQL file on either side; matching descriptions or normalized SQL are insufficient.
 
@@ -20,3 +22,13 @@ The provisional `MigrationCompatibilityIT` report records six passing cases: an 
 V4 introduced the mandatory acceptance-time policy snapshot, so a pre-V4 binary is not a write-compatible rollback target on the current V5 schema. The additive V5 index does not relax that boundary. No older released application exists for v0.1.0; cross-version application compatibility is therefore `NOT_APPLICABLE_FIRST_RELEASE`, not a passing rollback claim.
 
 Backup/restore instructions live in `docs/operations/backup-restore-runbook.md`. The 2026-09-01 provisional disposable rehearsal passed with byte-equivalent logical snapshots, eight passing invariant probes, observed RPO 0 seconds, measured restore 0.564 seconds and measured RTO 20.283 seconds. Those local measurements require final source-bound reproduction and are not production recovery commitments.
+
+## Current portfolio environment
+
+The portfolio profile executes the migration/callback tree through an owner-only
+one-shot CLI and excludes the global repeatable demo seed. It seeds fresh tenant
+entities transactionally for each visitor. The running API disables Flyway and
+holds only the restricted runtime database credential. V6 retains audit and
+in-flight workflow data when a session is reset or expires. Deployment compares
+the actual classpath resource tree, including callbacks; a changed tree requires
+a reviewed migration and recovery procedure. Code rollback does not undo SQL.
