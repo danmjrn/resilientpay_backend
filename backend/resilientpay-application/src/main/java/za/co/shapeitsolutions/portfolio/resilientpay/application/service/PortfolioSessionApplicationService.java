@@ -3,6 +3,7 @@ package za.co.shapeitsolutions.portfolio.resilientpay.application.service;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.model.PortfolioSession;
 import za.co.shapeitsolutions.portfolio.resilientpay.application.port.in.PortfolioSessions;
@@ -30,8 +31,12 @@ public final class PortfolioSessionApplicationService implements PortfolioSessio
 
     @Override
     public PortfolioSession create(String cookieHash, String gateHash, Instant gateExpiry) {
-        Instant now = clock.instant();
-        Instant expiry = now.plus(LIFETIME).isBefore(gateExpiry) ? now.plus(LIFETIME) : gateExpiry;
+        // PostgreSQL persists microseconds. Canonicalise before returning the created record so
+        // different JDK clock resolutions cannot change its representation on the next read.
+        // Truncation also guarantees that storage precision never extends the outer deadline.
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        Instant gateDeadline = gateExpiry.truncatedTo(ChronoUnit.MICROS);
+        Instant expiry = now.plus(LIFETIME).isBefore(gateDeadline) ? now.plus(LIFETIME) : gateDeadline;
         return transactions.required(() -> store.create(fresh(cookieHash, gateHash, expiry), now));
     }
 
@@ -42,7 +47,7 @@ public final class PortfolioSessionApplicationService implements PortfolioSessio
 
     @Override
     public PortfolioSession reset(String oldCookieHash, String newCookieHash, String gateHash) {
-        Instant now = clock.instant();
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
         return transactions.required(() -> {
             PortfolioSession current = store.active(oldCookieHash, gateHash, now);
             return store.reset(oldCookieHash, fresh(newCookieHash, gateHash, current.expiresAt()), now);

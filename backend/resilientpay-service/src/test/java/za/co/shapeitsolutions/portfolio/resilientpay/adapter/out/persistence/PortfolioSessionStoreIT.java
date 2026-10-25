@@ -177,6 +177,38 @@ class PortfolioSessionStoreIT {
     }
 
     @Test
+    void nanosecondClockRoundTripsExactlyAndNeverExtendsTheGateDeadline() {
+        Instant nanoseconds = Instant.now()
+                .minusSeconds(1)
+                .truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+                .plusNanos(123456789);
+        Clock fixed = Clock.fixed(nanoseconds, java.time.ZoneOffset.UTC);
+        PortfolioSessions precise =
+                new PortfolioSessionApplicationService(new PostgresPortfolioSessionStore(jdbc), boundary, fixed);
+        PortfolioSession created = precise.create(hash(), hash(), nanoseconds.plusSeconds(28800));
+        assertEquals(created, precise.active(created.cookieHash(), created.gateHash()));
+        assertEquals(
+                nanoseconds.truncatedTo(java.time.temporal.ChronoUnit.MICROS).plusSeconds(7200), created.expiresAt());
+        assertEquals(0, created.expiresAt().getNano() % 1000);
+        PortfolioSession reset = precise.reset(created.cookieHash(), hash(), created.gateHash());
+        assertEquals(reset, precise.active(reset.cookieHash(), reset.gateHash()));
+        assertEquals(created.expiresAt(), reset.expiresAt());
+        Instant gateDeadline = nanoseconds.plusSeconds(60).plusNanos(100);
+        PortfolioSession capped = precise.create(hash(), hash(), gateDeadline);
+        assertEquals(capped, precise.active(capped.cookieHash(), capped.gateHash()));
+        assertEquals(gateDeadline.truncatedTo(java.time.temporal.ChronoUnit.MICROS), capped.expiresAt());
+        assertFalse(capped.expiresAt().isAfter(gateDeadline));
+        PortfolioSessions expired = new PortfolioSessionApplicationService(
+                new PostgresPortfolioSessionStore(jdbc),
+                boundary,
+                Clock.fixed(capped.expiresAt(), java.time.ZoneOffset.UTC));
+        assertEquals(
+                ApplicationErrorCode.AUTHENTICATION_REQUIRED,
+                assertThrows(ApplicationException.class, () -> expired.active(capped.cookieHash(), capped.gateHash()))
+                        .code());
+    }
+
+    @Test
     void concurrentSameVisitorCreationCannotExceedFiveWorkspacesOrPartiallySeed() throws Exception {
         String gate = hash();
         CountDownLatch ready = new CountDownLatch(8);
