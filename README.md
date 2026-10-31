@@ -1,42 +1,34 @@
 # ResilientPay backend
 
-Private source component of Project 001 — ResilientPay Reversal Orchestrator,
-by Daniel Jr Nkulu / Shape It Solutions Pty Ltd.
+Demonstrate asynchronous payment-reversal orchestration with explicit retries, idempotency, reconciliation and recovery using synthetic transactions.
 
-Java 25, Spring Boot 4.1.1, Maven Wrapper, explicit reversal workflow and
-recovery semantics. Includes the domain, application, service and synthetic
-switch modules, API/event contracts, and database materials. Synthetic data
-only; no production payments, SLA, certification or regulatory approval claim.
+## Features
 
-## Build and run
+- Java domain, application and adapter modules.
+- Explicit reversal lifecycle and recovery semantics.
+- Synthetic switch integration and API/event contracts.
+- Database materials and engineering tests.
 
-Use the sibling-repository assembly described in
-[resilientpay_infrastructure](https://github.com/danmjrn/resilientpay_infrastructure/blob/main/publication/WORKSPACE.md).
-Original path prefixes are retained intentionally: tests and security tooling
-share contracts, scripts, dashboards and evidence with other components.
-Run the original documented commands from the assembled workspace, not from a
-partially cloned repository.
+## Requirements
 
-## Publication provenance
+Java 25, Spring Boot 4.1.1 and the Maven wrapper. Assemble the sibling workspace before cross-component checks.
 
-Source release: `787e9999df939191f1723b8de0f3613ea0cc1061`,
-original local tag `project-001-v0.1.0`. This repository retains the five
-path-relevant source commits, followed by publication changes. Filtering changes
-commit identifiers; it does not replace or rewrite the original 19-commit
-repository. The original ZIP is unchanged.
+## Settings and Configuration
 
-[Release documentation](https://github.com/danmjrn/resilientpay_documentation)
-contains the measured results and their limitations. The approved security
-exception SEC-EX-001 expires no later than 2026-11-19T00:00:00Z.
+Environment and setup details are retained in [README.reference.md](README.reference.md). Keep real credentials outside source and follow the project-specific configuration boundary.
 
-## Configuration
+## Known Issues and Scope
 
-No actual `.env` files or private identities belong here. Shared encrypted demo
-configuration is owned by
-[application_config](https://github.com/danmjrn/application_config/tree/main/apps/resilientpay).
-The infrastructure renderer requires an active, validated local bundle; the
-initial encrypted bootstrap bundle is deliberately not usable credentials.
-CI never decrypts application secrets.
+This documentation update does not change application code or relabel earlier verification as current. Existing release and deployment limits remain in force.
 
-The licence decision remains
-[explicitly reserved](https://github.com/danmjrn/resilientpay_documentation/blob/main/LICENSE-DECISION.md).
+## Release Notes
+
+- **31 October 2026 — documentation:** adopted a feature-first README structure based on the Reverse Engineering & Documentation Plugin. Application behavior, version pins, notices and existing verification records are unchanged.
+
+## Running the Project
+
+See [the complete engineering reference](README.reference.md) for the original setup, configuration, verification, operating limits and project-specific links. Its contents are preserved without changing historical evidence.
+
+## For More Information
+
+[Engineering reference](README.reference.md) · [README structure reference](https://github.com/danmjrn/ReverseEngineeringDocPlugin/blob/master/README.md)
